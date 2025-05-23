@@ -29,7 +29,11 @@ class MilvusManager:
     1. 如果提供了 `lite_path`，则使用 Milvus Lite 模式。
     2. 如果提供了网络 `uri` (http/https)，则使用标准网络连接。
     3. 如果提供了显式的 `host` (非 'localhost')，则使用 host/port 连接。
-    4. 如果以上都未提供，则默认使用 Milvus Lite，数据路径为当前文件向上追溯4层的目录下的 `milvus_data/default_milvus_lite.db`
+    4. 如果以上都未提供，则默认使用 Milvus Lite.
+       The default path is determined by `_get_default_lite_path()`, which typically resolves to
+       `mnemosyne_data/mnemosyne_lite.db` located four directories above the current file's directory.
+       This path can be fragile if the project's directory structure changes significantly.
+       It's recommended to explicitly provide `lite_path` for critical deployments.
     """
 
     def __init__(
@@ -149,12 +153,12 @@ class MilvusManager:
                     f"无法为 Milvus Lite 创建目录 '{db_dir}': {e}。请检查权限。"
                 )
                 # 也许应该在这里抛出异常，因为无法创建目录会导致连接失败
-                # raise OSError(f"无法为 Milvus Lite 创建目录 '{db_dir}': {e}") from e
+            raise OSError(f"无法为 Milvus Lite 创建目录 '{db_dir}': {e}") from e # Propagate error
             except Exception as e:  # 捕获其他潜在错误
                 logger.error(
-                    f"尝试为 Milvus Lite 创建目录 '{db_dir}' 时发生意外错误: {e}。"
+                f"尝试为 Milvus Lite 创建目录 '{db_dir}' 时发生意外错误: {e}。", exc_info=True
                 )
-                # raise # 重新抛出，让上层知道出错了
+            raise # Re-raise to indicate failure
 
     def _get_default_lite_path(self) -> str:
         """计算默认的 Milvus Lite 数据路径（当前文件上4层目录）。"""
@@ -171,19 +175,22 @@ class MilvusManager:
             return default_path
         except IndexError:
             # 使用当前工作目录下的默认文件名
-            fallback_dir = "."
-            fallback_path = self._prepare_lite_path(fallback_dir)
+            # This fallback might occur if path resolution fails (e.g., in a frozen executable without __file__)
+            fallback_dir = os.path.abspath(".") # Ensure it's an absolute path for consistency
+            fallback_path = self._prepare_lite_path(fallback_dir) # This will append 'mnemosyne_lite.db'
             logger.warning(
-                f"无法获取当前文件 '{__file__}' 的上4层目录结构，"
-                f"将使用当前工作目录下的 '{fallback_path}' 作为默认 Milvus Lite 路径。"
+                f"无法获取当前文件 '{__file__}' 的上4层目录结构 (IndexError)，"
+                f"将使用当前工作目录下的 '{fallback_path}' 作为默认 Milvus Lite 路径。",
+                exc_info=True # Log the IndexError for debugging
             )
             return fallback_path
         except Exception as e:
-            fallback_dir = "."
+            fallback_dir = os.path.abspath(".")
             fallback_path = self._prepare_lite_path(fallback_dir)
             logger.error(
                 f"计算默认 Milvus Lite 路径时发生意外错误: {e}，"
-                f"将使用当前工作目录下的 '{fallback_path}' 作为默认路径。"
+                f"将使用当前工作目录下的 '{fallback_path}' 作为默认路径。",
+                exc_info=True
             )
             return fallback_path
 
@@ -368,11 +375,11 @@ class MilvusManager:
             self._is_connected = True
             logger.info(f"成功连接到 {mode} (别名: {self.alias})。")
         except MilvusException as e:
-            logger.error(f"连接 {mode} (别名: {self.alias}) 失败: {e}")
+            logger.error(f"连接 {mode} (别名: {self.alias}) 失败: {e}", exc_info=True)
             self._is_connected = False
             raise  # 保留原始异常类型
         except Exception as e:  # 捕获其他潜在错误
-            logger.error(f"连接 {mode} (别名: {self.alias}) 时发生非 Milvus 异常: {e}")
+            logger.error(f"连接 {mode} (别名: {self.alias}) 时发生非 Milvus 异常: {e}", exc_info=True)
             self._is_connected = False
             # 将其包装成更通用的连接错误可能更好
             raise ConnectionError(f"连接 {mode} (别名: {self.alias}) 失败: {e}") from e
@@ -389,11 +396,11 @@ class MilvusManager:
             self._is_connected = False
             logger.info(f"成功断开 {mode} 连接 (别名: {self.alias})。")
         except MilvusException as e:
-            logger.error(f"断开 {mode} 连接 (别名: {self.alias}) 时出错: {e}")
+            logger.error(f"断开 {mode} 连接 (别名: {self.alias}) 时出错: {e}", exc_info=True)
             self._is_connected = False  # 即使出错，也标记为未连接
             raise
         except Exception as e:
-            logger.error(f"断开 {mode} 连接 (别名: {self.alias}) 时发生意外错误: {e}")
+            logger.error(f"断开 {mode} 连接 (别名: {self.alias}) 时发生意外错误: {e}", exc_info=True)
             self._is_connected = False
             raise
 
@@ -409,17 +416,19 @@ class MilvusManager:
             # 对于标准 Milvus 网络连接，执行一次轻量级检查
             try:
                 # 使用 has_collection 或 list_collections
-                utility.has_collection("__ping_test_collection__", using=self.alias)
+                # Use a more robust check like listing collections, as has_collection might not always hit the network
+                # utility.has_collection("__ping_test_collection__", using=self.alias) # This might be too simple
+                utility.list_collections(using=self.alias, timeout=5) # 5 second timeout for the check
                 return True
             except MilvusException as e:
                 logger.warning(
-                    f"Standard Milvus 连接检查失败 (alias: {self.alias}): {e}"
+                    f"Standard Milvus 连接检查 (list_collections) 失败 (alias: {self.alias}): {e}", exc_info=True
                 )
                 self._is_connected = False
                 return False
             except Exception as e:
                 logger.warning(
-                    f"Standard Milvus 连接检查时发生意外错误 (alias: {self.alias}): {e}"
+                    f"Standard Milvus 连接检查 (list_collections) 时发生意外错误 (alias: {self.alias}): {e}", exc_info=True
                 )
                 self._is_connected = False
                 return False
@@ -452,8 +461,13 @@ class MilvusManager:
         try:
             return utility.has_collection(collection_name, using=self.alias)
         except MilvusException as e:
-            logger.error(f"检查集合 '{collection_name}' 是否存在时出错: {e}")
-            return False  # 或者重新抛出异常，取决于你的错误处理策略
+            logger.error(f"检查集合 '{collection_name}' 是否存在时出错: {e}", exc_info=True)
+            # Depending on policy, you might want to raise e or return False
+            # For has_collection, returning False on error is often acceptable.
+            return False
+        except Exception as e:
+            logger.error(f"检查集合 '{collection_name}' 是否存在时发生意外错误: {e}", exc_info=True)
+            return False
 
     def create_collection(
         self, collection_name: str, schema: CollectionSchema, **kwargs
@@ -472,26 +486,30 @@ class MilvusManager:
             logger.warning(f"集合 '{collection_name}' 已存在。")
             # 返回现有集合的句柄
             try:
-                return Collection(name=collection_name, using=self.alias)
+                return Collection(name=collection_name, using=self.alias, **kwargs) # Pass kwargs for consistency_level etc.
+            except MilvusException as e:
+                logger.error(f"获取已存在集合 '{collection_name}' 句柄失败 (MilvusException): {e}", exc_info=True)
+                return None
             except Exception as e:
-                logger.error(f"获取已存在集合 '{collection_name}' 句柄失败: {e}")
+                logger.error(f"获取已存在集合 '{collection_name}' 句柄失败 (Exception): {e}", exc_info=True)
                 return None
 
         logger.info(f"尝试创建集合 '{collection_name}'...")
         try:
-            # 使用 Collection 类直接创建，它内部会调用 gRPC 创建
             collection = Collection(
                 name=collection_name, schema=schema, using=self.alias, **kwargs
             )
-            # 显式调用 utility.flush([collection_name]) 可能有助于确保集合元数据更新
-            # utility.flush([collection_name], using=self.alias)
-            logger.info(f"成功发送创建集合 '{collection_name}' 的请求。")
+            logger.info(f"成功发送创建集合 '{collection_name}' 的请求。 Collection object created.")
+            # It's good practice to ensure the collection is actually usable, e.g. by calling describe.
+            # collection.describe() # This would confirm creation on server.
+            # However, this might be too slow for just create_collection.
+            # Caller should handle potential issues if collection isn't immediately ready.
             return collection
         except MilvusException as e:
-            logger.error(f"创建集合 '{collection_name}' 失败: {e}")
-            return None  # 或者抛出异常
-        except Exception as e:  # 捕获其他可能的错误
-            logger.error(f"创建集合 '{collection_name}' 时发生意外错误: {e}")
+            logger.error(f"创建集合 '{collection_name}' 失败 (MilvusException): {e}", exc_info=True)
+            return None
+        except Exception as e:
+            logger.error(f"创建集合 '{collection_name}' 时发生意外错误 (Exception): {e}", exc_info=True)
             return None
 
     def drop_collection(
@@ -512,10 +530,13 @@ class MilvusManager:
         logger.info(f"尝试删除集合 '{collection_name}'...")
         try:
             utility.drop_collection(collection_name, timeout=timeout, using=self.alias)
-            logger.info(f"成功删除集合 '{collection_name}'。")
+            logger.info(f"成功发送删除集合 '{collection_name}' 的请求。")
             return True
         except MilvusException as e:
-            logger.error(f"删除集合 '{collection_name}' 失败: {e}")
+            logger.error(f"删除集合 '{collection_name}' 失败 (MilvusException): {e}", exc_info=True)
+            return False
+        except Exception as e:
+            logger.error(f"删除集合 '{collection_name}' 时发生意外错误 (Exception): {e}", exc_info=True)
             return False
 
     def list_collections(self) -> List[str]:
@@ -524,7 +545,10 @@ class MilvusManager:
         try:
             return utility.list_collections(using=self.alias)
         except MilvusException as e:
-            logger.error(f"列出集合失败: {e}")
+            logger.error(f"列出集合失败 (MilvusException): {e}", exc_info=True)
+            return []
+        except Exception as e:
+            logger.error(f"列出集合时发生意外错误 (Exception): {e}", exc_info=True)
             return []
 
     def get_collection(self, collection_name: str) -> Optional[Collection]:
@@ -546,20 +570,18 @@ class MilvusManager:
             collection = Collection(name=collection_name, using=self.alias)
             # 尝试调用一个简单的方法来确认句柄有效，如 describe()
             # 这会验证连接和集合存在性
-            # collection.describe()
+            # collection.describe() # This can confirm the collection is usable
             return collection
-        except (
-            CollectionNotExistException
-        ):  # 如果 has_collection 和 Collection 构造之间状态变化
+        except CollectionNotExistException: # More specific
             logger.warning(
                 f"获取集合 '{collection_name}' 句柄时发现其不存在 (可能刚被删除)。"
             )
             return None
         except MilvusException as e:
-            logger.error(f"获取集合 '{collection_name}' 句柄时出错: {e}")
+            logger.error(f"获取集合 '{collection_name}' 句柄时出错 (MilvusException): {e}", exc_info=True)
             return None
         except Exception as e:
-            logger.error(f"获取集合 '{collection_name}' 句柄时发生意外错误: {e}")
+            logger.error(f"获取集合 '{collection_name}' 句柄时发生意外错误 (Exception): {e}", exc_info=True)
             return None
 
     def get_collection_stats(self, collection_name: str) -> Dict[str, Any]:
@@ -584,10 +606,10 @@ class MilvusManager:
             # 返回标准化的字典，包含row_count
             return {"row_count": row_count, **dict(stats)}
         except MilvusException as e:
-            logger.error(f"获取集合 '{collection_name}' 统计信息失败: {e}")
-            return {"error": str(e)}
-        except Exception as e:  # 捕获其他错误
-            logger.error(f"获取集合 '{collection_name}' 统计信息时发生意外错误: {e}")
+            logger.error(f"获取集合 '{collection_name}' 统计信息失败 (MilvusException): {e}", exc_info=True)
+            return {"error": str(e), "milvus_code": e.code if hasattr(e, "code") else None}
+        except Exception as e:
+            logger.error(f"获取集合 '{collection_name}' 统计信息时发生意外错误 (Exception): {e}", exc_info=True)
             return {"error": f"Unexpected error: {str(e)}"}
 
     # --- Data Operations ---
@@ -635,13 +657,13 @@ class MilvusManager:
                 f"成功向集合 '{collection_name}' 插入数据。PKs: {mutation_result.primary_keys}"
             )
             # 考虑是否在这里自动 flush，或者让调用者决定
-            # self.flush([collection_name])
+            # self.flush([collection_name]) # Caller should decide if flush is needed immediately
             return mutation_result
         except MilvusException as e:
-            logger.error(f"向集合 '{collection_name}' 插入数据失败: {e}")
+            logger.error(f"向集合 '{collection_name}' 插入数据失败 (MilvusException): {e}", exc_info=True)
             return None
         except Exception as e:
-            logger.error(f"向集合 '{collection_name}' 插入数据时发生意外错误: {e}")
+            logger.error(f"向集合 '{collection_name}' 插入数据时发生意外错误 (Exception): {e}", exc_info=True)
             return None
 
     def delete(
@@ -685,14 +707,13 @@ class MilvusManager:
             logger.info(
                 f"成功从集合 '{collection_name}' 发送删除请求。删除数量: {delete_count} (注意: 实际删除需flush后生效)"
             )
-            # TODO 考虑是否在这里自动 flush
-            self.flush([collection_name])
+            # self.flush([collection_name]) # Caller might want to batch flushes
             return mutation_result
         except MilvusException as e:
-            logger.error(f"从集合 '{collection_name}' 删除实体失败: {e}")
+            logger.error(f"从集合 '{collection_name}' 删除实体失败 (MilvusException): {e}", exc_info=True)
             return None
         except Exception as e:
-            logger.error(f"从集合 '{collection_name}' 删除实体时发生意外错误: {e}")
+            logger.error(f"从集合 '{collection_name}' 删除实体时发生意外错误 (Exception): {e}", exc_info=True)
             return None
 
     def flush(self, collection_names: List[str], timeout: Optional[float] = None):
@@ -713,13 +734,13 @@ class MilvusManager:
             for collection_name in collection_names:
                 collection = Collection(collection_name, using=self.alias)
                 collection.flush(timeout=timeout)
-            # utility.flush(collection_names, timeout=timeout, using=self.alias)
+            # utility.flush(collection_names, timeout=timeout, using=self.alias) # This is a utility function, not on Collection object
             logger.info(f"成功刷新集合: {collection_names}。")
         except MilvusException as e:
-            logger.error(f"刷新集合 {collection_names} 失败: {e}")
-            # 根据需要决定是否抛出异常
+            logger.error(f"刷新集合 {collection_names} 失败 (MilvusException): {e}", exc_info=True)
+            # Consider raising e if flush is critical for subsequent operations by the caller
         except Exception as e:
-            logger.error(f"刷新集合 {collection_names} 时发生意外错误: {e}")
+            logger.error(f"刷新集合 {collection_names} 时发生意外错误 (Exception): {e}", exc_info=True)
         return
 
     # --- Indexing ---
@@ -788,9 +809,9 @@ class MilvusManager:
 
         except MilvusException as e:
             # 如果 has_index 出错，记录并继续尝试创建
-            logger.warning(f"检查索引是否存在时出错: {e}。将继续尝试创建索引。")
+            logger.warning(f"检查索引是否存在时出错 (MilvusException): {e}。将继续尝试创建索引。", exc_info=True)
         except Exception as e:
-            logger.warning(f"检查索引是否存在时发生意外错误: {e}。将继续尝试创建索引。")
+            logger.warning(f"检查索引是否存在时发生意外错误 (Exception): {e}。将继续尝试创建索引。", exc_info=True)
 
         logger.info(
             f"尝试在集合 '{collection_name}' 的字段 '{field_name}' 上创建索引 (名称: {effective_index_name})..."
@@ -815,12 +836,12 @@ class MilvusManager:
             return True
         except MilvusException as e:
             logger.error(
-                f"为集合 '{collection_name}' 字段 '{field_name}' 创建索引失败: {e}"
+                f"为集合 '{collection_name}' 字段 '{field_name}' 创建索引失败 (MilvusException): {e}", exc_info=True
             )
             return False
         except Exception as e:
             logger.error(
-                f"为集合 '{collection_name}' 字段 '{field_name}' 创建索引时发生意外错误: {e}"
+                f"为集合 '{collection_name}' 字段 '{field_name}' 创建索引时发生意外错误 (Exception): {e}", exc_info=True
             )
             return False
 
@@ -831,16 +852,16 @@ class MilvusManager:
             return False
         try:
             return collection.has_index(index_name=index_name, timeout=None)
-        except IndexNotExistException:  # 特别捕获索引不存在的异常
-            return False
+        except IndexNotExistException:
+            return False # This is an expected "not found" case.
         except MilvusException as e:
             logger.error(
-                f"检查集合 '{collection_name}' 的索引 '{index_name or '任意'}' 时出错: {e}"
+                f"检查集合 '{collection_name}' 的索引 '{index_name or '任意'}' 时出错 (MilvusException): {e}", exc_info=True
             )
-            return False  # 或者抛出异常
+            return False
         except Exception as e:
             logger.error(
-                f"检查集合 '{collection_name}' 的索引 '{index_name or '任意'}' 时发生意外错误: {e}"
+                f"检查集合 '{collection_name}' 的索引 '{index_name or '任意'}' 时发生意外错误 (Exception): {e}", exc_info=True
             )
             return False
 
@@ -864,8 +885,8 @@ class MilvusManager:
                 indices = collection.indexes
                 found = False
                 for index in indices:
-                    if index.field_name == field_name:
-                        effective_index_name = index.index_name
+                    if index.field_name == field_name: # pyright: ignore [reportGeneralTypeIssues]
+                        effective_index_name = index.index_name # pyright: ignore [reportGeneralTypeIssues]
                         logger.info(
                             f"找到与字段 '{field_name}' 关联的索引: '{effective_index_name}'。"
                         )
@@ -873,52 +894,66 @@ class MilvusManager:
                         break
                 if not found:
                     logger.warning(
-                        f"在集合 '{collection_name}' 中未找到与字段 '{field_name}' 关联的索引，无法删除。"
+                        f"在集合 '{collection_name}' 中未找到与字段 '{field_name}' 关联的索引，无需删除。"
                     )
-                    return True  # 没有对应索引，认为目标达成
+                    return True # No index for this field, so considered successful.
+            except MilvusException as e:
+                 logger.error(
+                    f"查找字段 '{field_name}' 的索引时出错 (MilvusException): {e}。无法继续删除。", exc_info=True
+                )
+                 return False
             except Exception as e:
                 logger.error(
-                    f"查找字段 '{field_name}' 的索引时出错: {e}。无法继续删除。"
+                    f"查找字段 '{field_name}' 的索引时发生意外错误 (Exception): {e}。无法继续删除。", exc_info=True
                 )
                 return False
-        elif not effective_index_name and not field_name:
-            logger.error("必须提供 index_name 或 field_name 来删除索引。")
+        elif not effective_index_name and not field_name: # Should have been caught by initial check, but defensive.
+            logger.error("逻辑错误: 必须提供 index_name 或 field_name 来删除索引。")
             return False
 
-        # 检查索引是否存在
+
+        # Re-check if effective_index_name is now set (especially if found via field_name)
+        if not effective_index_name:
+            logger.error("删除索引失败：未能确定有效的索引名称。")
+            return False
+
         try:
-            if not collection.has_index(index_name=effective_index_name):
+            if not collection.has_index(index_name=effective_index_name): # pyright: ignore [reportUnknownArgumentType]
                 logger.warning(
                     f"尝试删除不存在的索引（名称: {effective_index_name}）于集合 '{collection_name}'。"
                 )
-                return True  # 认为目标状态已达到
-        except IndexNotExistException:
+                return True
+        except IndexNotExistException: # Expected if index does not exist
             logger.warning(
-                f"尝试删除不存在的索引（名称: {effective_index_name}）于集合 '{collection_name}'。"
+                f"索引 '{effective_index_name}' 在集合 '{collection_name}' 中不存在 (IndexNotExistException)。"
             )
             return True
+        except MilvusException as e:
+            logger.warning(
+                f"检查索引 '{effective_index_name}' 是否存在时出错 (MilvusException): {e}。将继续尝试删除。", exc_info=True
+            )
         except Exception as e:
             logger.warning(
-                f"检查索引 '{effective_index_name}' 是否存在时出错: {e}。将继续尝试删除。"
+                f"检查索引 '{effective_index_name}' 是否存在时发生意外错误 (Exception): {e}。将继续尝试删除。", exc_info=True
             )
 
         logger.info(
             f"尝试删除集合 '{collection_name}' 上的索引 (名称: {effective_index_name})..."
         )
         try:
-            collection.drop_index(index_name=effective_index_name, timeout=timeout)
+            collection.drop_index(index_name=effective_index_name, timeout=timeout) # pyright: ignore [reportUnknownArgumentType]
             logger.info(
-                f"成功删除集合 '{collection_name}' 上的索引 (名称: {effective_index_name})。"
+                f"成功发送删除集合 '{collection_name}' 上的索引 (名称: {effective_index_name}) 的请求。"
             )
             return True
         except MilvusException as e:
             logger.error(
-                f"删除集合 '{collection_name}' 上的索引 '{effective_index_name}' 失败: {e}"
+                f"删除集合 '{collection_name}' 上的索引 '{effective_index_name}' 失败 (MilvusException): {e}", exc_info=True
             )
             return False
         except Exception as e:
             logger.error(
-                f"删除集合 '{collection_name}' 上的索引 '{effective_index_name}' 时发生意外错误: {e}"
+                f"删除集合 '{collection_name}' 上的索引 '{effective_index_name}' 时发生意外错误 (Exception): {e}", exc_info=True
             )
             return False
 
@@ -952,32 +987,35 @@ class MilvusManager:
                 return True
         except Exception as e:
             if e.code == 101:  # 集合未加载
-                logger.warning(f"集合 '{collection_name}' 尚未加载，将尝试加载。")
-            else:
+                logger.warning(f"集合 '{collection_name}' 尚未加载 (Milvus code 101)，将尝试加载。")
+            else: # Other MilvusException
                 logger.error(
-                    f"检查集合 '{collection_name}' 加载状态时出错: {e}。将尝试加载。"
+                    f"检查集合 '{collection_name}' 加载状态时出错 (MilvusException): {e}。将尝试加载。", exc_info=True
                 )
+        except Exception as e: # Non-Milvus exception during loading_progress check
+             logger.error(
+                    f"检查集合 '{collection_name}' 加载状态时发生意外错误 (Exception): {e}。将尝试加载。", exc_info=True
+                )
+
 
         logger.info(f"尝试将集合 '{collection_name}' 加载到内存...")
         try:
             collection.load(replica_number=replica_number, timeout=timeout, **kwargs)
-            # 检查加载进度/等待完成
             logger.info(f"等待集合 '{collection_name}' 加载完成...")
             utility.wait_for_loading_complete(
-                collection_name, using=self.alias, timeout=timeout
+                collection_name, using=self.alias, timeout=timeout # Can specify a longer timeout here if needed
             )
             logger.info(f"成功加载集合 '{collection_name}' 到内存。")
             return True
         except MilvusException as e:
-            logger.error(f"加载集合 '{collection_name}' 失败: {e}")
-            # 常见错误：未创建索引
-            if "index not found" in str(e).lower():
+            logger.error(f"加载集合 '{collection_name}' 失败 (MilvusException): {e}", exc_info=True)
+            if hasattr(e, "code") and e.code == 1 and "index not found" in str(e).lower(): # More specific check for common error
                 logger.error(
-                    f"加载失败原因可能是集合 '{collection_name}' 尚未创建索引。"
+                    f"加载失败原因可能是集合 '{collection_name}' 尚未创建索引或索引未构建完成。"
                 )
             return False
         except Exception as e:
-            logger.error(f"加载集合 '{collection_name}' 时发生意外错误: {e}")
+            logger.error(f"加载集合 '{collection_name}' 时发生意外错误 (Exception): {e}", exc_info=True)
             return False
 
     def release_collection(
@@ -992,23 +1030,27 @@ class MilvusManager:
         try:
             progress = utility.loading_progress(collection_name, using=self.alias)
             if progress and progress.get("loading_progress") == 0:
-                logger.info(f"集合 '{collection_name}' 未加载，无需释放。")
+                logger.info(f"集合 '{collection_name}' 未加载 (progress 0)，无需释放。")
                 return True
-        except Exception as e:
+        except MilvusException as e: # Catch specific Milvus errors during check
             logger.warning(
-                f"检查集合 '{collection_name}' 加载状态时出错: {e}。将尝试释放。"
+                f"检查集合 '{collection_name}' 加载状态时出错 (MilvusException): {e}。将继续尝试释放。", exc_info=True
+            )
+        except Exception as e: # Catch other errors during check
+            logger.warning(
+                f"检查集合 '{collection_name}' 加载状态时发生意外错误 (Exception): {e}。将继续尝试释放。", exc_info=True
             )
 
         logger.info(f"尝试从内存中释放集合 '{collection_name}'...")
         try:
             collection.release(timeout=timeout, **kwargs)
-            logger.info(f"成功从内存中释放集合 '{collection_name}'。")
+            logger.info(f"成功发送从内存中释放集合 '{collection_name}' 的请求。")
             return True
         except MilvusException as e:
-            logger.error(f"释放集合 '{collection_name}' 失败: {e}")
+            logger.error(f"释放集合 '{collection_name}' 失败 (MilvusException): {e}", exc_info=True)
             return False
         except Exception as e:
-            logger.error(f"释放集合 '{collection_name}' 时发生意外错误: {e}")
+            logger.error(f"释放集合 '{collection_name}' 时发生意外错误 (Exception): {e}", exc_info=True)
             return False
 
     def search(
@@ -1088,14 +1130,14 @@ class MilvusManager:
             # # 示例：记录第一个查询的命中数
             # if search_result and len(search_result[0]) > 0:
             #     logger.debug(f"第一个查询向量命中 {len(search_result[0])} 个结果。")
-            # logger.debug(f"第一个结果示例 - ID: {search_result[0][0].id}, 距离: {search_result[0][0].distance}")
+            # logger.debug(f"第一个结果示例 - ID: {search_result[0][0].id}, 距离: {search_result[0][0].distance}") # pyright: ignore [reportOptionalSubscript]
 
-            return search_result  # 返回原始的 SearchResult 列表
+            return search_result
         except MilvusException as e:
-            logger.error(f"在集合 '{collection_name}' 中搜索失败: {e}")
+            logger.error(f"在集合 '{collection_name}' 中搜索失败 (MilvusException): {e}", exc_info=True)
             return None
         except Exception as e:
-            logger.error(f"在集合 '{collection_name}' 中搜索时发生意外错误: {e}")
+            logger.error(f"在集合 '{collection_name}' 中搜索时发生意外错误 (Exception): {e}", exc_info=True)
             return None
 
     def query(
@@ -1174,13 +1216,13 @@ class MilvusManager:
                 **kwargs,
             )
             # query_results is List[Dict]
-            logger.info(f"查询完成。返回 {len(query_results)} 个实体。")
-            return query_results
+            logger.info(f"查询完成。返回 {len(query_results)} 个实体。") # pyright: ignore [reportUnboundVariable]
+            return query_results # pyright: ignore [reportUnboundVariable]
         except MilvusException as e:
-            logger.error(f"在集合 '{collection_name}' 中执行查询失败: {e}")
+            logger.error(f"在集合 '{collection_name}' 中执行查询失败 (MilvusException): {e}", exc_info=True)
             return None
         except Exception as e:
-            logger.error(f"在集合 '{collection_name}' 中执行查询时发生意外错误: {e}")
+            logger.error(f"在集合 '{collection_name}' 中执行查询时发生意外错误 (Exception): {e}", exc_info=True)
             return None
 
     # --- Context Manager Support ---
@@ -1188,20 +1230,20 @@ class MilvusManager:
         """支持 with 语句，进入时确保连接。"""
         try:
             self._ensure_connected()  # 确保连接，如果失败会抛异常
-        except Exception as e:
-            logger.error(f"进入 MilvusManager 上下文管理器时连接失败: {e}")
-            raise  # 重新抛出异常，阻止进入 with 块
+        except Exception as e: # Catch any connection error during __enter__
+            logger.error(f"进入 MilvusManager 上下文管理器时连接失败: {e}", exc_info=True)
+            raise # Re-throw to prevent 'with' block execution if connection fails
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         """支持 with 语句，退出时断开连接。"""
         try:
             self.disconnect()
-        except Exception as e:
-            logger.error(f"退出 MilvusManager 上下文管理器时断开连接失败: {e}")
-        # 可以根据 exc_type 等参数决定是否记录异常信息
+        except Exception as e: # Catch any error during disconnect
+            logger.error(f"退出 MilvusManager 上下文管理器时断开连接失败: {e}", exc_info=True)
+        # Log if an exception occurred within the 'with' block
         if exc_type:
             logger.error(
-                f"MilvusManager 上下文管理器退出时捕获到异常: {exc_type.__name__}: {exc_val}"
+                f"MilvusManager 上下文管理器内发生异常: {exc_type.__name__}: {exc_val}", exc_info=(exc_type, exc_val, exc_tb)
             )
         # 返回 False 表示如果发生异常，不抑制异常的传播

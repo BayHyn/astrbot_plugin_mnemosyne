@@ -1,167 +1,217 @@
 # -*- coding: utf-8 -*-
 """
-Mnemosyne 插件核心记忆操作逻辑
-包括 RAG 查询、LLM 响应处理、记忆总结与存储。
+Mnemosyne 插件核心记忆操作逻辑。
+包括 RAG (Retrieval Augmented Generation) 查询、LLM 响应处理、记忆注入等。
+记忆总结和存储相关逻辑已移至 `summarization_service.py`。
 """
 
-import time
-import asyncio
-from datetime import datetime
-from typing import TYPE_CHECKING, List, Dict, Optional, Any
+import time # 用于时间相关操作，例如生成时间戳（如果需要）
+import asyncio # 用于异步操作，例如运行 executor 中的同步函数
+from datetime import datetime # 用于格式化时间戳
+from typing import TYPE_CHECKING, List, Dict, Optional, Any, cast # 类型注解
 
-from astrbot.api.provider import LLMResponse, ProviderRequest
-from astrbot.api.event import AstrMessageEvent
-from pymilvus.exceptions import MilvusException
+# AstrBot API 导入
+from astrbot.api.provider import LLMResponse, ProviderRequest # LLM 提供者相关
+from astrbot.api.event import AstrMessageEvent # 消息事件对象
+from pymilvus.exceptions import MilvusException # Milvus 特定异常
+from pymilvus.orm.search import Hit, Hits # Milvus 搜索结果类型 (用于更精确的类型提示)
 
-from .tools import (
+# 插件内部模块导入
+from .tools import ( # 导入工具函数，用于清理上下文中的记忆标签
     remove_mnemosyne_tags,
     remove_system_mnemosyne_tags,
     remove_system_content,
-    format_context_to_string,
 )
-
-# 导入必要的类型和模块
-from .constants import (
-    VECTOR_FIELD_NAME,
-    DEFAULT_TOP_K,
-    DEFAULT_MILVUS_TIMEOUT,
-    DEFAULT_PERSONA_ON_NONE,
+from . import summarization_service # 导入总结服务模块
+from .constants import ( # 导入常量
+    VECTOR_FIELD_NAME, DEFAULT_TOP_K, DEFAULT_MILVUS_TIMEOUT, DEFAULT_PERSONA_ON_NONE,
+    PRIMARY_FIELD_NAME, # 在 _process_milvus_hits 中用于日志和可能的补充
+    MEMORY_OPS_LOG_NAME, ROLE_USER, ROLE_ASSISTANT, ROLE_SYSTEM,
+    CONFIG_KEY_USE_PERSONALITY_FILTERING, CONFIG_KEY_TOP_K, CONFIG_KEY_MILVUS_SEARCH_TIMEOUT,
+    CONFIG_KEY_LONG_MEMORY_PREFIX, CONFIG_KEY_LONG_MEMORY_SUFFIX, CONFIG_KEY_MEMORY_ENTRY_FORMAT,
+    CONFIG_KEY_MEMORY_INJECTION_METHOD, CONFIG_KEY_CONTEXTS_MEMORY_LEN,
+    INJECTION_METHOD_USER_PROMPT, INJECTION_METHOD_SYSTEM_PROMPT, INJECTION_METHOD_INSERT_SYSTEM_PROMPT
 )
 
 # 类型提示，避免循环导入
 if TYPE_CHECKING:
-    from ..main import Mnemosyne
+    from ..main import Mnemosyne # 引用主插件类 Mnemosyne
 
+# 获取日志记录器
 from astrbot.core.log import LogManager
-
-logger = LogManager.GetLogger(__name__)
+logger = LogManager.GetLogger(log_name=MEMORY_OPS_LOG_NAME) # 使用常量中定义的日志名称
 
 
 async def handle_query_memory(
     plugin: "Mnemosyne", event: AstrMessageEvent, req: ProviderRequest
-):
+) -> None:
     """
-    处理 LLM 请求前的 RAG 检索逻辑。
-    检索相关的长期记忆，并将其注入到 ProviderRequest 中。
-    """
-    # logger = plugin.logger
+    处理 LLM 请求前的 RAG (Retrieval Augmented Generation) 检索逻辑。
+    此函数负责：
+    1. 检查 RAG 执行的前提条件（如 Milvus 和 Embedding 服务是否可用）。
+    2. 获取当前会话和人格（Persona）信息。
+    3. 初始化或更新会话上下文。
+    4. 将用户的新消息添加到上下文中并增加消息计数。
+    5. 对用户查询进行向量化。
+    6. 执行 Milvus 向量搜索以检索相关记忆。
+    7. 将检索到的记忆格式化并注入到 LLM 的请求中。
 
-    # --- 前置检查 ---
+    Args:
+        plugin ("Mnemosyne"): Mnemosyne 插件的实例，包含配置和各种管理器。
+        event (AstrMessageEvent): 触发此操作的消息事件对象。
+        req (ProviderRequest): 即将发送给 LLM 服务提供者的请求对象，将被修改以注入记忆。
+    """
+    # --- 1. 前置条件检查 ---
     if not await _check_rag_prerequisites(plugin):
+        logger.debug("RAG 前提条件未满足，跳过记忆查询。")
         return
 
     try:
-        # --- 获取会话和人格信息 ---
-        persona_id = await _get_persona_id(plugin, event)
-        session_id = await plugin.context.conversation_manager.get_curr_conversation_id(
+        # --- 2. 获取会话和人格信息 ---
+        persona_id: Optional[str] = await _get_persona_id(plugin, event)
+        session_id: Optional[str] = await plugin.context.conversation_manager.get_curr_conversation_id(
             event.unified_msg_origin
         )
-        # 判断是否在历史会话管理器中，如果不在，则进行初始化
-        if session_id not in plugin.context_manager.conversations:
-            plugin.context_manager.init_conv(session_id, req.contexts, event)
+        if not session_id: # 理论上 AstrBot 应保证 session_id 存在
+            logger.error("无法获取当前会话 ID (session_id)，记忆查询中止。")
+            return
 
-        # 清理记忆标签
-        clean_contexts(plugin, req)
+        # --- 3. 初始化或更新会话上下文 ---
+        # 如果是新会话，从 ProviderRequest 初始化上下文历史
+        if session_id not in plugin.context_manager.conversations: # type: ignore
+            logger.info(f"会话 {session_id} 为新会话，使用 ProviderRequest 中的上下文进行初始化。")
+            plugin.context_manager.init_conv(session_id, req.contexts, event) # type: ignore
 
-        # 添加用户消息
-        plugin.context_manager.add_message(session_id, "user", req.prompt)
-        # 计数器+1
-        plugin.msg_counter.increment_counter(session_id)
+        # --- 4. 清理旧记忆标签并添加新用户消息 ---
+        clean_contexts(plugin, req) # 从 req.contexts 中移除之前可能注入的记忆标签
 
-        # --- RAG 搜索 ---
-        detailed_results = []
+        # 将当前用户消息添加到插件管理的上下文中
+        # ROLE_USER 常量代表 "user"
+        plugin.context_manager.add_message(session_id, ROLE_USER, req.prompt, event) # type: ignore
+        # 增加此会话的消息计数
+        plugin.msg_counter.increment_counter(session_id) # type: ignore
+        logger.debug(f"用户消息已添加到会话 {session_id} 的上下文中并更新了消息计数。")
+
+        # --- 5. RAG 搜索 ---
+        detailed_results: Optional[List[Dict[str, Any]]] = [] # 初始化为空列表
         try:
-            # 1. 向量化用户查询
+            # 5.1. 向量化用户查询
+            query_embeddings: Optional[List[List[float]]]
             try:
+                # 在 executor 中运行同步的 embedding 获取方法
+                if not plugin.ebd: # 双重检查 ebd 是否有效
+                    logger.error("Embedding 服务在查询时无效，无法向量化用户输入。")
+                    return
                 query_embeddings = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: plugin.ebd.get_embeddings([req.prompt]),
-
+                    None, # 使用默认线程池
+                    lambda: plugin.ebd.get_embeddings([req.prompt]), # type: ignore
                 )
-            except Exception as e:
-                logger.error(f"执行 Embedding 获取时出错: {e}", exc_info=True)
-                query_embeddings = None  # 确保后续能处理失败
+            except Exception as e_embed: # 捕获 embedding 过程中的任何异常
+                logger.error(f"执行用户查询向量化时出错: {e_embed}", exc_info=True)
+                query_embeddings = None # 标记向量化失败
 
-            if not query_embeddings:
-                logger.error("无法获取用户查询的 Embedding 向量。")
+            if not query_embeddings or not query_embeddings[0]:
+                logger.error("无法获取用户查询的 Embedding 向量，RAG 检索中止。")
                 return
-            query_vector = query_embeddings[0]
+            query_vector: List[float] = query_embeddings[0] # 获取第一个（也是唯一的）查询向量
 
-            # 2. 执行 Milvus 搜索
+            # 5.2. 执行 Milvus 向量搜索
             detailed_results = await _perform_milvus_search(
                 plugin, query_vector, session_id, persona_id
             )
 
-            # 3. 格式化结果并注入到提示中
-            if detailed_results:
+            # 5.3. 格式化结果并注入到 LLM 请求中
+            if detailed_results: # 如果找到了相关记忆
                 _format_and_inject_memory(plugin, detailed_results, req)
+            else:
+                logger.info(f"会话 {session_id} 的 RAG 搜索未找到相关记忆。")
 
-        except Exception as e:
-            logger.error(f"处理长期记忆 RAG 查询时发生错误: {e}", exc_info=True)
-            return
+        except Exception as e_rag: # 捕获 RAG 搜索流程中的其他错误
+            logger.error(f"处理长期记忆 RAG 查询时发生内部错误: {e_rag}", exc_info=True)
+            return # 发生错误则不继续
 
-    except Exception as e:
-        logger.error(f"处理 LLM 请求前的记忆查询流程失败: {e}", exc_info=True)
+    except Exception as e_main: # 捕获整个 handle_query_memory 流程的顶层错误
+        logger.error(f"处理 LLM 请求前的记忆查询流程遭遇意外失败: {e_main}", exc_info=True)
 
 
 async def handle_on_llm_resp(
     plugin: "Mnemosyne", event: AstrMessageEvent, resp: LLMResponse
-):
+) -> None:
     """
-    处理 LLM 响应后的逻辑。更新计数器。
+    处理 LLM 响应后的逻辑。
+    主要职责：
+    1. 校验响应角色（应为助手角色）。
+    2. 获取会话和人格信息。
+    3. 将 LLM 的响应添加到插件管理的上下文中并更新消息计数。
+    4. 调用总结服务检查是否需要触发记忆总结。
+
+    Args:
+        plugin ("Mnemosyne"): Mnemosyne 插件的实例。
+        event (AstrMessageEvent): 触发此操作的消息事件对象。
+        resp (LLMResponse): 从 LLM 服务提供者返回的响应对象。
     """
-    if resp.role != "assistant":
-        logger.warning("LLM 响应不是助手角色，不进行记录。")
+    # 仅处理来自助手 (assistant) 角色的响应
+    # ROLE_ASSISTANT 常量代表 "assistant"
+    if resp.role != ROLE_ASSISTANT:
+        logger.debug(f"LLM 响应角色为 '{resp.role}' (非 '{ROLE_ASSISTANT}')，不进行记忆处理。")
         return
 
     try:
-        session_id = await plugin.context.conversation_manager.get_curr_conversation_id(
+        session_id: Optional[str] = await plugin.context.conversation_manager.get_curr_conversation_id(
             event.unified_msg_origin
         )
         if not session_id:
-            logger.error("无法获取当前 session_id,无法记录 LLM 响应到Mnemosyne。")
+            logger.error("无法获取当前 session_id，无法记录 LLM 响应到 Mnemosyne。")
             return
-        persona_id = await _get_persona_id(plugin, event)
 
-        # 判断是否需要总结
-        await _check_and_trigger_summary(
-            plugin,
-            session_id,
-            plugin.context_manager.get_history(session_id),
-            persona_id,
-        )
+        persona_id: Optional[str] = await _get_persona_id(plugin, event)
 
-        plugin.logger.debug(f"返回的内容：{resp.completion_text}")
-        plugin.context_manager.add_message(
-            session_id, "assistant", resp.completion_text
+        # 将 LLM 响应添加到上下文并更新计数器
+        # (注意：add_message 现在需要 event 参数，如果会话是新创建的)
+        # 由于这是 LLM 响应，理论上会话已通过 handle_query_memory 初始化，event 对象应已存在于 context_manager 中
+        plugin.context_manager.add_message(session_id, ROLE_ASSISTANT, resp.completion_text) # type: ignore
+        plugin.msg_counter.increment_counter(session_id) # type: ignore
+        logger.debug(f"LLM 响应已添加到会话 {session_id} 的上下文中并更新了消息计数。")
+        logger.debug(f"LLM 返回的文本内容片段：'{resp.completion_text[:100]}...'")
+
+
+        # 调用总结服务，判断是否需要基于当前上下文和计数器状态触发总结
+        # summarization_service._check_and_trigger_summary 内部会处理计数器重置和总结时间更新
+        await summarization_service._check_and_trigger_summary( # type: ignore
+            plugin, # 传递插件实例
+            session_id, # 当前会话 ID
+            plugin.context_manager.get_history(session_id), # type: ignore # 获取当前会话的完整历史
+            persona_id, # 当前人格 ID
         )
-        plugin.msg_counter.increment_counter(session_id)
 
     except Exception as e:
-        logger.error(f"处理 LLM 响应后的记忆记录失败: {e}", exc_info=True)
+        logger.error(f"处理 LLM 响应后的记忆记录或总结触发失败: {e}", exc_info=True)
 
 
-# 记忆查询 (RAG) 相关函数
 async def _check_rag_prerequisites(plugin: "Mnemosyne") -> bool:
     """
-    检查 RAG 查询的前提条件是否满足。
+    检查 RAG (Retrieval Augmented Generation) 查询的前提条件是否满足。
+    确保 Milvus 服务、Embedding API 和消息计数器都已正确初始化。
 
     Args:
-        plugin: Mnemosyne 插件实例。
+        plugin ("Mnemosyne"): Mnemosyne 插件实例。
 
     Returns:
-        True 如果前提条件满足，False 否则。
+        bool: 如果所有前提条件均满足，则返回 `True`；否则返回 `False`。
     """
-    # logger = plugin.logger
+    # 检查 Milvus 管理器及其连接状态
     if not plugin.milvus_manager or not plugin.milvus_manager.is_connected():
-        logger.error("Milvus 服务未初始化或未连接，无法查询长期记忆。")
+        logger.error("Milvus 服务未初始化或未连接，无法执行 RAG 查询。")
         return False
+    # 检查 Embedding API 是否已初始化
     if not plugin.ebd:
-        logger.error("Embedding API 未初始化，无法查询长期记忆。")
+        logger.error("Embedding API 未初始化，无法执行 RAG 查询（无法向量化）。")
         return False
+    # 检查消息计数器是否已初始化 (虽然主要用于总结，但检查完整性)
     if not plugin.msg_counter:
-        logger.error("消息计数器未初始化，将无法实现记忆总结")
+        logger.error("消息计数器 (MessageCounter) 未初始化，RAG 流程可能受影响（例如总结触发）。")
         return False
+    logger.debug("RAG 前提条件检查通过。")
     return True
 
 
@@ -169,71 +219,51 @@ async def _get_persona_id(
     plugin: "Mnemosyne", event: AstrMessageEvent
 ) -> Optional[str]:
     """
-    获取当前会话的人格 ID。
+    获取当前会话的人格 (Persona) ID。
+    会尝试从当前会话的上下文中获取，如果未设置，则尝试获取 AstrBot 的全局默认人格。
+    如果两者均未配置，且插件配置了 `use_personality_filtering`，则可能使用 `DEFAULT_PERSONA_ON_NONE`。
 
     Args:
-        plugin: Mnemosyne 插件实例。
-        event: 消息事件。
+        plugin ("Mnemosyne"): Mnemosyne 插件实例。
+        event (AstrMessageEvent): 当前消息事件对象。
 
     Returns:
-        人格 ID 字符串，如果没有人格或发生错误则为 None。
+        Optional[str]: 人格 ID 字符串。如果无法确定人格或不使用人格过滤，则可能为 `None`。
     """
-    # logger = plugin.logger
-    session_id = await plugin.context.conversation_manager.get_curr_conversation_id(
+    session_id: Optional[str] = await plugin.context.conversation_manager.get_curr_conversation_id(
         event.unified_msg_origin
     )
+    # 从 AstrBot 的会话管理器获取当前会话对象
     conversation = await plugin.context.conversation_manager.get_conversation(
         event.unified_msg_origin, session_id
     )
-    persona_id = conversation.persona_id if conversation else None
+    persona_id: Optional[str] = conversation.persona_id if conversation else None # 获取会话特定的人格ID
 
+    # 如果会话没有人格ID (或为特殊标记 "[%None]")，则尝试获取全局默认人格
     if not persona_id or persona_id == "[%None]":
-        default_persona = plugin.context.provider_manager.selected_default_persona
-        persona_id = default_persona["name"] if default_persona else None
-        if not persona_id:
-            logger.warning(
-                f"当前会话 (ID: {session_id}) 及全局均未配置人格，将使用占位符 '{DEFAULT_PERSONA_ON_NONE}' 进行记忆操作（如果启用人格过滤）。"
-            )
-            if plugin.config.get("use_personality_filtering", False):
-                persona_id = DEFAULT_PERSONA_ON_NONE
-            else:
-                persona_id = None
-        else:
-            logger.info(f"当前会话无人格，使用默认人格: '{persona_id}'")
+        default_persona_info: Optional[Dict[str, Any]] = plugin.context.provider_manager.selected_default_persona
+        persona_id = default_persona_info["name"] if default_persona_info and "name" in default_persona_info else None
+        log_prefix = f"会话 {session_id}: " if session_id else "当前会话: "
+        if persona_id:
+            logger.info(f"{log_prefix}未设置特定人格，将使用全局默认人格: '{persona_id}'。")
+        else: # 全局默认人格也未配置
+            # CONFIG_KEY_USE_PERSONALITY_FILTERING 是 "use_personality_filtering"
+            # DEFAULT_PERSONA_ON_NONE 是 "default_persona"
+            if plugin.config.get(CONFIG_KEY_USE_PERSONALITY_FILTERING, False):
+                persona_id = DEFAULT_PERSONA_ON_NONE # 使用预设的占位符人格ID
+                logger.warning(
+                    f"{log_prefix}及全局均未配置人格。由于启用了人格过滤，将使用占位符 '{persona_id}' 进行记忆操作。"
+                )
+            else: # 未启用人格过滤，且无明确人格ID
+                logger.info(
+                    f"{log_prefix}及全局均未配置人格，且未启用人格过滤。记忆操作将不区分人格。"
+                )
+                persona_id = None # 明确设为 None
     return persona_id
 
 
-async def _check_and_trigger_summary(
-    plugin: "Mnemosyne",
-    session_id: str,
-    context: List[Dict],
-    persona_id: Optional[str],
-):
-    """
-    检查是否满足总结条件并触发总结任务。
-
-    Args:
-        plugin: Mnemosyne 插件实例。
-        session_id: 会话 ID。
-        context: 请求上下文列表。
-        persona_id: 人格 ID.
-    """
-    if plugin.msg_counter.adjust_counter_if_necessary(
-        session_id, context
-    ) and plugin.msg_counter.get_counter(session_id) >= plugin.config.get(
-        "num_pairs", 10
-    ):
-        logger.info("开始总结历史对话...")
-        history_contents = format_context_to_string(
-            context, plugin.config.get("num_pairs", 10)
-        )
-        # logger.debug(f"总结的部分{history_contents}")
-
-        asyncio.create_task(
-            handle_summary_long_memory(plugin, persona_id, session_id, history_contents)
-        )
-        logger.info("总结历史对话任务已提交到后台执行。")
-        plugin.msg_counter.reset_counter(session_id)
+# _check_and_trigger_summary 和其他总结相关函数已移至 core.summarization_service.py
+# （占位注释，实际代码已删除）
 
 
 async def _perform_milvus_search(
@@ -241,544 +271,259 @@ async def _perform_milvus_search(
     query_vector: List[float],
     session_id: Optional[str],
     persona_id: Optional[str],
-) -> Optional[List[Dict]]:
+) -> Optional[List[Dict[str, Any]]]:
     """
-    执行 Milvus 向量搜索。
+    在 Milvus 中执行向量相似性搜索。
 
     Args:
-        plugin: Mnemosyne 插件实例。
-        query_vector: 查询向量。
-        session_id: 会话 ID。
-        persona_id: 人格 ID。
+        plugin ("Mnemosyne"): Mnemosyne 插件实例。
+        query_vector (List[float]): 用于查询的嵌入向量。
+        session_id (Optional[str]): 当前会话的 ID，用于构建过滤表达式。
+        persona_id (Optional[str]): 当前人格的 ID，用于构建过滤表达式（如果启用了人格过滤）。
 
     Returns:
-        Milvus 搜索结果列表，如果没有找到或出错则为 None。
+        Optional[List[Dict[str, Any]]]: 包含搜索结果实体字典的列表。
+                                         如果搜索无结果或发生错误，则返回 `None`。
     """
-    # logger = plugin.logger
-    # 防止没有过滤条件引发的潜在错误
-    filters = ["memory_id > 0"]
+    # 构建 Milvus 搜索的过滤表达式 (filter expression)
+    filters: List[str] = [f"{PRIMARY_FIELD_NAME} > 0"] # 基础过滤器，确保 memory_id 有效 (通常 auto_id 从1开始)
+
+    # 如果有会话 ID，则添加会话过滤条件
     if session_id:
-        filters.append(f'session_id == "{session_id}"')
-    else:
-        logger.warning("无法获取当前 session_id，将不按 session 过滤记忆！")
+        filters.append(f'session_id == "{session_id}"') # 注意 Milvus 表达式中字符串需要双引号
+    else: # 理论上 session_id 在 RAG 流程中应该存在
+        logger.warning("执行 Milvus 搜索时无法获取当前 session_id，将不按特定会话过滤记忆！")
 
-    use_personality_filtering = plugin.config.get("use_personality_filtering", False)
-    effective_persona_id_for_filter = persona_id
-    if use_personality_filtering and effective_persona_id_for_filter:
-        filters.append(f'personality_id == "{effective_persona_id_for_filter}"')
-        logger.debug(f"将使用人格 '{effective_persona_id_for_filter}' 过滤记忆。")
-    elif use_personality_filtering:
-        logger.debug("启用了人格过滤，但当前无有效人格 ID，不按人格过滤。")
+    # 如果启用了人格过滤 (use_personality_filtering) 且当前有人格 ID，则添加人格过滤条件
+    # CONFIG_KEY_USE_PERSONALITY_FILTERING 是 "use_personality_filtering"
+    use_personality_filtering: bool = plugin.config.get(CONFIG_KEY_USE_PERSONALITY_FILTERING, False)
+    if use_personality_filtering and persona_id:
+        filters.append(f'personality_id == "{persona_id}"')
+        logger.debug(f"Milvus 搜索将使用人格 '{persona_id}' 进行过滤。")
+    elif use_personality_filtering: # 启用了人格过滤但当前无人格
+        logger.debug("启用了人格过滤，但当前无有效人格 ID，本次搜索不按人格进行过滤。")
 
-    search_expression = " and ".join(filters) if filters else ""
-    collection_name = plugin.collection_name
-    top_k = plugin.config.get("top_k", DEFAULT_TOP_K)
-    timeout_seconds = plugin.config.get("milvus_search_timeout", DEFAULT_MILVUS_TIMEOUT)
+    # 组合所有过滤条件
+    search_expression: str = " and ".join(filters) if filters else ""
+
+    collection_name: str = plugin.collection_name # 当前使用的集合名
+    # CONFIG_KEY_TOP_K 是 "top_k", DEFAULT_TOP_K 是 5
+    top_k: int = plugin.config.get(CONFIG_KEY_TOP_K, DEFAULT_TOP_K)
+    # CONFIG_KEY_MILVUS_SEARCH_TIMEOUT 是 "milvus_search_timeout", DEFAULT_MILVUS_TIMEOUT 是 10.0
+    timeout_seconds: float = plugin.config.get(CONFIG_KEY_MILVUS_SEARCH_TIMEOUT, DEFAULT_MILVUS_TIMEOUT)
 
     logger.info(
-        f"开始在集合 '{collection_name}' 中搜索相关记忆 (TopK: {top_k}, Filter: '{search_expression or '无'}')"
+        f"开始在 Milvus 集合 '{collection_name}' 中搜索相关记忆 "
+        f"(TopK: {top_k}, Filter: '{search_expression or '无过滤'}', Timeout: {timeout_seconds}s)"
     )
 
     try:
-        search_results = await asyncio.wait_for(
+        # 使用 asyncio.wait_for 来为 Milvus 的同步搜索操作设置超时
+        # MilvusManager.search 方法是同步的，因此需要在 executor 中运行以避免阻塞事件循环
+        if not plugin.milvus_manager: # 防御性检查
+             logger.error("MilvusManager 未初始化，无法执行搜索。")
+             return None
+
+        search_results_raw = await asyncio.wait_for(
             asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: plugin.milvus_manager.search(
+                None, # 使用默认线程池
+                lambda: plugin.milvus_manager.search( # type: ignore
                     collection_name=collection_name,
-                    query_vectors=[query_vector],
-                    vector_field=VECTOR_FIELD_NAME,
-                    search_params=plugin.search_params,
+                    query_vectors=[query_vector], # search 方法期望向量列表
+                    vector_field=VECTOR_FIELD_NAME, # "vector"
+                    search_params=plugin.search_params, # 从插件实例获取搜索参数
                     limit=top_k,
                     expression=search_expression,
-                    output_fields=plugin.output_fields_for_query,
+                    output_fields=plugin.output_fields_for_query, # 从插件实例获取输出字段
                 ),
             ),
-            timeout=timeout_seconds,
+            timeout=timeout_seconds, # 应用超时
         )
-    except asyncio.TimeoutError:
-        logger.error(f"Milvus 搜索超时 ({timeout_seconds} 秒)，操作已取消。")
+        # search_results_raw 的类型是 List[Hits]
+        # Hits 是一个类列表对象，包含多个 Hit 对象
+        # 每个 Hit 对象代表一个搜索命中的结果
+
+    except asyncio.TimeoutError: # 特别捕获超时错误
+        logger.error(f"Milvus 搜索操作因超时 ({timeout_seconds} 秒) 而取消。")
         return None
-    except MilvusException as me:
+    except MilvusException as me: # 捕获 Milvus 特有的异常
         logger.error(f"Milvus 搜索操作失败: {me}", exc_info=True)
         return None
-    except Exception as e:
+    except Exception as e: # 捕获其他潜在的未知错误
         logger.error(f"执行 Milvus 搜索时发生未知错误: {e}", exc_info=True)
         return None
 
-    if not search_results or not search_results[0]:
-        logger.info("向量搜索未找到相关记忆。")
+    # 处理搜索结果
+    if not search_results_raw or not search_results_raw[0]: # 检查是否有结果，以及第一个查询是否有命中
+        logger.info("Milvus 向量搜索未找到任何相关记忆。")
         return None
     else:
-        # 从 search_results 中获取 Hits 对象
-        hits = search_results[0]
-        # 调用新的辅助函数来处理 Hits 对象并提取详细结果
-        detailed_results = _process_milvus_hits(hits)
+        # search_results_raw[0] 是对应第一个（也是唯一一个）查询向量的 Hits 对象
+        hits: Hits = search_results_raw[0]
+        # 调用辅助函数处理 Hits 对象并提取详细实体数据
+        detailed_results: List[Dict[str, Any]] = _process_milvus_hits(hits)
+        logger.info(f"Milvus 搜索成功，处理了 {len(hits)} 个原始命中，提取了 {len(detailed_results)} 条有效记忆。")
         return detailed_results
 
 
-def _process_milvus_hits(hits) -> List[Dict[str, Any]]:
+def _process_milvus_hits(hits: Hits) -> List[Dict[str, Any]]:
     """
-    处理 Milvus SearchResults 中的 Hits 对象，使用基于索引的遍历方式
-    提取有效的记忆实体数据。
+    处理 Milvus `Hits` 对象，提取每个 `Hit` 中的实体数据。
+    `Hits` 对象表现得像一个列表，其中每个元素是一个 `Hit` 对象。
+    每个 `Hit` 对象有一个 `entity` 属性，它通常需要调用 `.to_dict()` 来获取标准字典。
 
     Args:
-        hits: 从 Milvus 搜索结果 search_results[0] 中获取的 Hits 对象。
+        hits (Hits): 从 Milvus `search` 方法返回的 `Hits` 对象。
 
     Returns:
-        一个包含提取到的记忆实体字典的列表。如果没有任何有效实体被提取，
-        则返回空列表 []。
+        List[Dict[str, Any]]: 一个包含从每个 `Hit` 中提取的实体数据的字典列表。
+                              如果 `hits` 为空或处理过程中发生错误，可能返回空列表。
     """
-    detailed_results: List[Dict[str, Any]] = []  # 初始化结果列表，指定类型
+    detailed_results: List[Dict[str, Any]] = []
+    if not hits: # 如果没有命中结果
+        return detailed_results
 
-    # 使用索引遍历 hits 对象，以绕过 SequenceIterator 的迭代问题
-    if hits:  # 确保 hits 对象不是空的或 None
-        try:
-            num_hits = len(hits)  # 获取命中数量
-            logger.debug(f"Milvus 返回了 {num_hits} 条原始命中结果。")
+    try:
+        num_hits = len(hits)
+        logger.debug(f"开始处理 {num_hits} 条 Milvus 原始命中结果...")
+        for i in range(num_hits):
+            try:
+                hit: Hit = hits[i] # 获取单个 Hit 对象
+                # Hit 对象有一个 entity 属性，它是一个 Entity 对象
+                # Entity 对象有 to_dict() 方法，但其返回的字典可能包含 'entity' 键，实际数据在该键下
+                if hit and hasattr(hit, "entity") and hit.entity:
+                    # Milvus 的 Hit.entity.to_dict() 返回的可能是 {'entity': {...actual_fields...}}
+                    # 或者直接是 {...actual_fields...}，取决于版本或具体情况，做兼容处理
+                    entity_raw_dict = hit.entity.to_dict()
+                    entity_data: Optional[Dict[str, Any]]
+                    if 'entity' in entity_raw_dict and isinstance(entity_raw_dict['entity'], dict):
+                        entity_data = entity_raw_dict['entity']
+                    else: # 假设 to_dict() 直接返回了字段字典
+                        entity_data = entity_raw_dict
 
-            # 使用索引进行遍历
-            for i in range(num_hits):
-                try:
-                    hit = hits[i]  # 通过索引获取单个 Hit 对象
-
-                    # 检查 hit 对象及其 entity 属性是否存在且有效
-                    # 使用 hasattr 更健壮，避免在 entity 属性不存在时报错
-                    if hit and hasattr(hit, "entity") and hit.entity:
-                        # 提取 entity 数据，使用 .get() 避免 KeyError
-                        # 假设 entity.to_dict() 返回的字典中有 "entity" 键
-                        entity_data = hit.entity.to_dict().get("entity")
-                        # 如果成功提取到数据，则添加到结果列表
-                        if entity_data:
-                            detailed_results.append(entity_data)
-                        else:
-                            # 如果 entity 存在但提取的数据为空，可能是数据结构问题
-                            logger.warning(
-                                f"命中结果索引 {i} 处的 entity 数据为空或无效，已跳过。"
-                            )
+                    if entity_data:
+                        # 确保主键字段存在于实体数据中，这对于调试和某些操作很重要
+                        if PRIMARY_FIELD_NAME not in entity_data and hasattr(hit, 'id'):
+                            entity_data[PRIMARY_FIELD_NAME] = hit.id # 从 Hit 对象补充 id
+                        detailed_results.append(entity_data)
                     else:
-                        # 如果 hit 或 entity 无效，则跳过
-                        logger.debug(f"命中结果索引 {i} 处对象或 entity 无效，已跳过。")
+                        logger.warning(f"处理 Milvus 命中结果索引 {i} 时：实体数据为空或无效。原始Hit ID: {hit.id if hasattr(hit, 'id') else 'N/A'}")
+                else:
+                    logger.debug(f"处理 Milvus 命中结果索引 {i} 时：Hit 对象或其 entity 属性无效，已跳过。")
+            except Exception as e_hit: # 处理单个 Hit 对象时发生的错误
+                logger.error(f"处理 Milvus 单个命中结果 (索引 {i}) 时发生错误: {e_hit}", exc_info=True)
+                # 选择继续处理下一个 Hit，而不是中断整个流程
 
-                except Exception as e:
-                    # 处理访问或处理单个 hit 时可能出现的错误
-                    logger.error(
-                        f"处理索引 {i} 处的命中结果时发生错误: {e}", exc_info=True
-                    )
-                    # 发生错误时继续处理下一个 hit，不中断整个流程
+    except Exception as e_hits_processing: # 处理整个 Hits 集合时发生的更严重错误
+        logger.error(f"处理 Milvus Hits 集合时发生严重错误: {e_hits_processing}", exc_info=True)
+        # 此时 detailed_results 可能不完整或为空
 
-        except Exception as e:
-            # 处理获取长度或设置循环时可能出现的更严重的错误
-            # 如果在这里发生错误，detailed_results 可能不完整或为空
-            logger.error(f"执行基于索引的命中结果处理时发生错误: {e}", exc_info=True)
-
-    # 记录成功处理并提取记忆的记录数
-    logger.debug(f"成功处理并提取记忆的记录数: {len(detailed_results)} 条。")
-
+    logger.debug(f"成功从 Milvus Hits 中提取并处理了 {len(detailed_results)} 条记忆实体。")
     return detailed_results
 
 
-# LLM 响应处理相关函数
 def _format_and_inject_memory(
-    plugin: "Mnemosyne", detailed_results: List[Dict], req: ProviderRequest
-):
+    plugin: "Mnemosyne", detailed_results: List[Dict[str, Any]], req: ProviderRequest
+) -> None:
     """
-    格式化搜索结果并注入到 ProviderRequest 中。
+    将从 Milvus 检索到的详细记忆结果格式化为字符串，并根据配置注入到 LLM 的请求中。
 
     Args:
-        plugin: Mnemosyne 插件实例。
-        detailed_results: 详细的搜索结果列表。
-        req: ProviderRequest 对象。
+        plugin ("Mnemosyne"): Mnemosyne 插件实例，用于访问配置。
+        detailed_results (List[Dict[str, Any]]): 包含从 Milvus 获取的记忆实体的字典列表。
+        req (ProviderRequest): 即将发送给 LLM 的请求对象，将被修改。
     """
-    # logger = plugin.logger
-    if not detailed_results:
-        logger.info("未找到或获取到相关的长期记忆，不进行补充。")
+    if not detailed_results: # 如果没有详细结果，则不执行任何操作
+        logger.info("没有可供格式化和注入的长期记忆。")
         return
 
-    long_memory_prefix = plugin.config.get(
-        "long_memory_prefix", "<Mnemosyne> 长期记忆片段："
-    )
-    long_memory_suffix = plugin.config.get("long_memory_suffix", "</Mnemosyne>")
-    long_memory = f"{long_memory_prefix}\n"
+    # 从配置中获取记忆片段的前缀、后缀和单条记忆的格式化字符串
+    # CONFIG_KEY_LONG_MEMORY_PREFIX 等是常量
+    long_memory_prefix: str = plugin.config.get(CONFIG_KEY_LONG_MEMORY_PREFIX, "<Mnemosyne> 长期记忆片段：")
+    long_memory_suffix: str = plugin.config.get(CONFIG_KEY_LONG_MEMORY_SUFFIX, "</Mnemosyne>")
+    memory_entry_format_template: str = plugin.config.get(CONFIG_KEY_MEMORY_ENTRY_FORMAT, "- [{time}] {content}")
 
-    for result in detailed_results:
-        content = result.get("content", "内容缺失")
-        ts = result.get("create_time")
+    # 构建注入的长期记忆字符串
+    formatted_memories_str: str = f"{long_memory_prefix}\n" # 添加前缀和换行
+
+    for idx, result_entity in enumerate(detailed_results):
+        content: str = result_entity.get("content", "内容缺失") # 获取记忆内容
+        timestamp_val: Optional[float] = result_entity.get("create_time") # 获取创建时间戳
+        time_str: str
         try:
-            time_str = (
-                datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
-                if ts
-                else "未知时间"
-            )
-        except (TypeError, ValueError):
-            time_str = f"时间戳: {ts}" if ts else "未知时间"
+            # 将 Unix 时间戳格式化为易读的日期时间字符串
+            time_str = datetime.fromtimestamp(cast(float, timestamp_val)).strftime("%Y-%m-%d %H:%M") if timestamp_val else "未知时间"
+        except (TypeError, ValueError, OSError) as e_time: # 处理无效时间戳
+            logger.warning(f"格式化记忆条目 (ID: {result_entity.get(PRIMARY_FIELD_NAME, 'N/A')}) 的时间戳 '{timestamp_val}' 时出错: {e_time}")
+            time_str = f"时间戳({timestamp_val})" if timestamp_val is not None else "未知时间"
 
-        memory_entry_format = plugin.config.get(
-            "memory_entry_format", "- [{time}] {content}"
-        )
-        long_memory += memory_entry_format.format(time=time_str, content=content) + "\n"
+        # 使用配置的格式化模板格式化单条记忆
+        formatted_memories_str += memory_entry_format_template.format(time=time_str, content=content) + "\n"
 
-    long_memory += long_memory_suffix
+    formatted_memories_str += long_memory_suffix # 添加后缀
+    logger.info(f"已成功格式化 {len(detailed_results)} 条长期记忆，准备注入到提示中。")
+    logger.debug(f"格式化后的记忆内容预览:\n{formatted_memories_str[:500]}...") # 记录部分内容用于调试
 
-    logger.info(f"补充了 {len(detailed_results)} 条长期记忆到提示中。")
-    logger.debug(f"补充内容:\n{long_memory}")
+    # 根据配置的注入方法 (memory_injection_method) 将格式化记忆注入到请求中
+    # CONFIG_KEY_MEMORY_INJECTION_METHOD 是 "memory_injection_method"
+    # INJECTION_METHOD_USER_PROMPT, _SYSTEM_PROMPT, _INSERT_SYSTEM_PROMPT 是常量
+    injection_method: str = plugin.config.get(CONFIG_KEY_MEMORY_INJECTION_METHOD, INJECTION_METHOD_USER_PROMPT)
 
-    injection_method = plugin.config.get("memory_injection_method", "user_prompt")
-
-    # 清理插入的长期记忆内容
+    # 在注入前，先清理上下文中可能已存在的旧记忆标签
     clean_contexts(plugin, req)
-    if injection_method == "user_prompt":
-        req.prompt = long_memory + "\n" + req.prompt
 
-    elif injection_method == "system_prompt":
-        req.system_prompt += long_memory
-
-    elif injection_method == "insert_system_prompt":
-        req.contexts.append({"role": "system", "content": long_memory})
-
-    else:
+    if injection_method == INJECTION_METHOD_USER_PROMPT: # "user_prompt"
+        # 将记忆追加到用户提示 (prompt) 的最前面
+        req.prompt = formatted_memories_str + "\n" + req.prompt
+        logger.debug("长期记忆已注入到用户提示 (user_prompt) 的开头。")
+    elif injection_method == INJECTION_METHOD_SYSTEM_PROMPT: # "system_prompt"
+        # 将记忆追加到系统提示 (system_prompt)
+        req.system_prompt = (req.system_prompt or "") + "\n" + formatted_memories_str # 确保 system_prompt 非 None
+        logger.debug("长期记忆已追加到系统提示 (system_prompt)。")
+    elif injection_method == INJECTION_METHOD_INSERT_SYSTEM_PROMPT: # "insert_system_prompt"
+        # 将记忆作为一条新的系统角色消息插入到上下文历史 (contexts) 中
+        # ROLE_SYSTEM 是 "system"
+        req.contexts.append({"role": ROLE_SYSTEM, "content": formatted_memories_str})
+        logger.debug("长期记忆已作为一条系统消息插入到上下文历史 (contexts) 中。")
+    else: # 未知或不支持的注入方法
         logger.warning(
-            f"未知的记忆注入方法 '{injection_method}'，将默认追加到用户 prompt。"
+            f"配置了未知的记忆注入方法 '{injection_method}'，将默认采用追加到用户提示 (user_prompt) 的方式。"
         )
-        req.prompt = long_memory + "\n" + req.prompt
+        req.prompt = formatted_memories_str + "\n" + req.prompt
 
 
-# 删除补充的长期记忆函数
-def clean_contexts(plugin: "Mnemosyne", req: ProviderRequest):
+def clean_contexts(plugin: "Mnemosyne", req: ProviderRequest) -> None:
     """
-    删除长期记忆中的标签
+    根据配置的记忆注入方法，从 ProviderRequest 的上下文中移除之前由本插件注入的长期记忆标签。
+    这是为了防止在多次交互或重新生成响应时，旧的记忆标签被重复处理或累积。
+
+    Args:
+        plugin ("Mnemosyne"): Mnemosyne 插件实例，用于访问配置。
+        req (ProviderRequest): 需要清理上下文的 ProviderRequest 对象。
     """
-    injection_method = plugin.config.get("memory_injection_method", "user_prompt")
-    contexts_memory_len = plugin.config.get("contexts_memory_len", 0)
-    if injection_method == "user_prompt":
+    # CONFIG_KEY_MEMORY_INJECTION_METHOD, INJECTION_METHOD_USER_PROMPT 等是常量
+    injection_method: str = plugin.config.get(CONFIG_KEY_MEMORY_INJECTION_METHOD, INJECTION_METHOD_USER_PROMPT)
+    # CONFIG_KEY_CONTEXTS_MEMORY_LEN 是 "contexts_memory_len"
+    contexts_memory_len: int = plugin.config.get(CONFIG_KEY_CONTEXTS_MEMORY_LEN, 0) # 获取配置的上下文记忆长度
+
+    # 根据注入方法选择相应的清理工具函数
+    if injection_method == INJECTION_METHOD_USER_PROMPT:
+        # 如果记忆是注入到用户提示中，则清理 req.contexts (通常是历史对话)
         req.contexts = remove_mnemosyne_tags(req.contexts, contexts_memory_len)
-    elif injection_method == "system_prompt":
-        req.system_prompt = remove_system_mnemosyne_tags(
-            req.system_prompt, contexts_memory_len
-        )
-    elif injection_method == "insert_system_prompt":
+        logger.debug("已尝试从 req.contexts 中移除用户提示型记忆标签。")
+    elif injection_method == INJECTION_METHOD_SYSTEM_PROMPT:
+        # 如果记忆是注入到系统提示中，则清理 req.system_prompt
+        req.system_prompt = remove_system_mnemosyne_tags(req.system_prompt or "", contexts_memory_len)
+        logger.debug("已尝试从 req.system_prompt 中移除系统提示型记忆标签。")
+    elif injection_method == INJECTION_METHOD_INSERT_SYSTEM_PROMPT:
+        # 如果记忆是作为系统消息插入的，则从 req.contexts 中移除这类系统消息
         req.contexts = remove_system_content(req.contexts, contexts_memory_len)
+        logger.debug("已尝试从 req.contexts 中移除作为系统消息注入的记忆内容。")
+    # 如果是未知方法，在 _format_and_inject_memory 中已按 user_prompt 处理，此处无需额外操作
     return
 
 
-# 记忆总结相关函数
-async def _check_summary_prerequisites(plugin: "Mnemosyne", memory_text: str) -> bool:
-    """
-    检查记忆总结的前提条件是否满足。
-
-    Args:
-        plugin: Mnemosyne 插件实例。
-        memory_text: 记忆文本。
-
-    Returns:
-        True 如果前提条件满足，False 否则。
-    """
-    # logger = plugin.logger
-    if not plugin.milvus_manager or not plugin.milvus_manager.is_connected():
-        logger.error("Milvus 服务不可用，无法存储总结后的长期记忆。")
-        return False
-    if not plugin.ebd:
-        logger.error("Embedding API 不可用，无法向量化总结记忆。")
-        return False
-    if not memory_text or not memory_text.strip():
-        logger.warning("尝试总结空的或仅包含空白的记忆文本，跳过。")
-        return False
-    return True
-
-
-async def _get_summary_llm_response(
-    plugin: "Mnemosyne", memory_text: str
-) -> Optional[LLMResponse]:
-    """
-    请求 LLM 进行记忆总结。
-
-    Args:
-        plugin: Mnemosyne 插件实例。
-        memory_text: 需要总结的记忆文本。
-
-    Returns:
-        LLMResponse 对象，如果请求失败则为 None。
-    """
-    # logger = plugin.logger
-    llm_provider = plugin.provider
-    # TODO 这部分逻辑真史，回头改下
-    try:
-        if not llm_provider:
-            # 如果plugin.provider不正确，在这时候，使用当前使用的LLM服务商，避免错误
-            llm_provider = plugin.context.get_using_provider()
-            if not llm_provider:
-                logger.error("无法获取用于总结记忆的 LLM Provider。")
-                return None
-    except Exception as e:
-        logger.error(f"获取 LLM Provider 时出错: {e}", exc_info=True)
-        return None
-
-    long_memory_prompt = plugin.config.get(
-        "long_memory_prompt",
-        "请将以下多轮对话历史总结为一段简洁、客观、包含关键信息的长期记忆条目:",
-    )
-    summary_llm_config = plugin.config.get("summary_llm_config", {})
-
-    logger.debug(
-        f"请求 LLM 总结短期记忆，提示: '{long_memory_prompt[:50]}...', 内容长度: {len(memory_text)}"
-    )
-
-    try:
-        llm_response = await llm_provider.text_chat(
-            prompt=memory_text,
-            contexts=[{"role": "system", "content": long_memory_prompt}],
-            **summary_llm_config,
-        )
-        logger.debug(f"LLM 总结响应原始数据: {llm_response}")
-        return llm_response
-    except Exception as e:
-        logger.error(f"LLM 总结请求失败: {e}", exc_info=True)
-        return None
-
-
-def _extract_summary_text(
-    plugin: "Mnemosyne", llm_response: LLMResponse
-) -> Optional[str]:
-    """
-    从 LLM 响应中提取总结文本并进行校验。
-
-    Args:
-        plugin: Mnemosyne 插件实例。
-        llm_response: LLMResponse 对象。
-
-    Returns:
-        总结文本字符串，如果提取失败则为 None。
-    """
-    # logger = plugin.logger
-    completion_text = None
-    if isinstance(llm_response, LLMResponse):
-        completion_text = llm_response.completion_text
-        # role = llm_response.role
-    elif isinstance(llm_response, dict):
-        completion_text = llm_response.get("completion_text")
-        # role = llm_response.get("role")
-    else:
-        logger.error(f"LLM 总结返回了未知类型的数据: {type(llm_response)}")
-        return None
-
-    if not completion_text or not completion_text.strip():
-        logger.error(f"LLM 总结响应无效或内容为空。原始响应: {llm_response}")
-        return None
-
-    summary_text = completion_text.strip()
-    logger.info(f"LLM 成功生成记忆总结，长度: {len(summary_text)}")
-    return summary_text
-
-
-async def _store_summary_to_milvus(
-    plugin: "Mnemosyne",
-    persona_id: Optional[str],
-    session_id: str,
-    summary_text: str,
-    embedding_vector: List[float],
-):
-    """
-    将总结文本和向量存储到 Milvus 中。
-
-    Args:
-        plugin: Mnemosyne 插件实例。
-        persona_id: 人格 ID。
-        session_id: 会话 ID。
-        summary_text: 总结文本。
-        embedding_vector: 总结文本的 Embedding 向量。
-    """
-    # logger = plugin.logger
-    collection_name = plugin.collection_name
-    current_timestamp = int(time.time())
-
-    effective_persona_id = (
-        persona_id
-        if persona_id
-        else plugin.config.get("default_persona_id_on_none", DEFAULT_PERSONA_ON_NONE)
-    )
-
-    data_to_insert = [
-        {
-            "personality_id": effective_persona_id,
-            "session_id": session_id,
-            "content": summary_text,
-            VECTOR_FIELD_NAME: embedding_vector,
-            "create_time": current_timestamp,
-        }
-    ]
-
-    logger.info(
-        f"准备向集合 '{collection_name}' 插入 1 条总结记忆 (Persona: {effective_persona_id}, Session: {session_id[:8]}...)"
-    )
-    # mutation_result = plugin.milvus_manager.insert(
-    #     collection_name=collection_name,
-    #     data=data_to_insert,
-    # )
-    # --- 修改 insert 调用 ---
-    loop = asyncio.get_event_loop()
-    mutation_result = None
-    try:
-        mutation_result = await loop.run_in_executor(
-            None,  # 使用默认线程池
-            lambda: plugin.milvus_manager.insert(
-                collection_name=collection_name, data=data_to_insert
-            ),
-        )
-    except Exception as e:
-        logger.error(f"向 Milvus 插入总结记忆时出错: {e}", exc_info=True)
-
-    if mutation_result and mutation_result.insert_count > 0:
-        inserted_ids = mutation_result.primary_keys
-        logger.info(f"成功插入总结记忆到 Milvus。插入 ID: {inserted_ids}")
-
-        try:
-            logger.debug(
-                f"正在刷新 (Flush) 集合 '{collection_name}' 以确保记忆立即可用..."
-            )
-            # plugin.milvus_manager.flush([collection_name])
-            await loop.run_in_executor(
-                None,  # 使用默认线程池
-                lambda: plugin.milvus_manager.flush([collection_name]),
-            )
-            logger.debug(f"集合 '{collection_name}' 刷新完成。")
-
-        except Exception as flush_err:
-            logger.error(
-                f"刷新集合 '{collection_name}' 时出错: {flush_err}",
-                exc_info=True,
-            )
-    else:
-        logger.error(
-            f"插入总结记忆到 Milvus 失败。MutationResult: {mutation_result}. LLM 回复: {summary_text[:100]}..."
-        )
-
-
-async def handle_summary_long_memory(
-    plugin: "Mnemosyne", persona_id: Optional[str], session_id: str, memory_text: str
-):
-    """
-    使用 LLM 总结短期对话历史形成长期记忆，并将其向量化后存入 Milvus。
-    这是一个后台任务。
-    """
-    # logger = plugin.logger
-
-    # --- 前置检查 ---
-    if not await _check_summary_prerequisites(plugin, memory_text):
-        return
-
-    try:
-        # 1. 请求 LLM 进行总结
-        llm_response = await _get_summary_llm_response(plugin, memory_text)
-        if not llm_response:
-            return
-
-        # 2. 提取总结文本
-        summary_text = _extract_summary_text(plugin, llm_response)
-        if not summary_text:
-            return
-
-        # 3. 获取总结文本的 Embedding
-        # embedding_vectors = plugin.ebd.get_embeddings(summary_text)
-        try:
-            embedding_vectors = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: plugin.ebd.get_embeddings([summary_text]),
-
-            )
-        except Exception as e:
-            logger.error(
-                f"获取总结文本 Embedding 时出错: '{summary_text[:100]}...' - {e}",
-                exc_info=True,
-            )
-            embedding_vectors = None  # 确保后续能处理失败
-
-        if not embedding_vectors:
-            logger.error(f"无法获取总结文本的 Embedding: '{summary_text[:100]}...'")
-            return
-        embedding_vector = embedding_vectors[0]
-
-        # 4. 存储到 Milvus
-        await _store_summary_to_milvus(
-            plugin, persona_id, session_id, summary_text, embedding_vector
-        )
-        return
-    except Exception as e:
-        logger.error(f"在总结或存储长期记忆的过程中发生严重错误: {e}", exc_info=True)
-
-
-# 计时器
-async def _periodic_summarization_check(plugin: "Mnemosyne"):
-    """
-    [后台任务] 定期检查并触发超时的会话总结
-    """
-    logger.info(
-        f"启动定期总结检查任务，检查间隔: {plugin.summary_check_interval}秒, 总结时间阈值: {plugin.summary_time_threshold}秒。"
-    )
-    while True:
-        try:
-            await asyncio.sleep(plugin.summary_check_interval)  # <--- 等待指定间隔
-
-            if not plugin.context_manager or plugin.summary_time_threshold == float(
-                "inf"
-            ):
-                # 如果上下文管理器未初始化或阈值无效，则跳过本次检查
-                continue
-
-            current_time = time.time()
-            session_ids_to_check = list(plugin.context_manager.conversations.keys())
-
-            # logger.debug(f"开始检查 {len(session_ids_to_check)} 个会话的总结超时...")
-
-            for session_id in session_ids_to_check:
-                try:
-                    session_context = plugin.context_manager.get_session_context(
-                        session_id
-                    )
-                    if not session_context:  # 会话可能在检查期间被移除
-                        continue
-                    if plugin.msg_counter.get_counter(session_id) <= 0:
-                        logger.debug(f"会话 {session_id} 没有新消息，跳过检查。")
-                        continue
-
-                    last_summary_time = session_context["last_summary_time"]
-
-                    if current_time - last_summary_time > plugin.summary_time_threshold:
-                        # logger.debug(f"current_time {current_time} - last_summary_time {last_summary_time} : {current_time - last_summary_time}")
-                        logger.info(
-                            f"会话 {session_id} 距离上次总结已超过阈值 ({plugin.summary_time_threshold}秒)，触发强制总结。"
-                        )
-                        # 运行总结
-                        logger.info("开始总结历史对话...")
-                        history_contents = format_context_to_string(
-                            session_context["history"],
-                            plugin.msg_counter.get_counter(session_id),
-                        )
-                        # logger.debug(f"总结的部分{history_contents}")
-                        persona_id = await _get_persona_id(
-                            plugin, session_context["event"]
-                        )
-                        asyncio.create_task(
-                            handle_summary_long_memory(
-                                plugin, persona_id, session_id, history_contents
-                            )
-                        )
-                        logger.info("总结历史对话任务已提交到后台执行。")
-
-                        plugin.msg_counter.reset_counter(session_id)
-                        plugin.context_manager.update_summary_time(session_id)
-
-                except KeyError:
-                    # 会话在获取 keys 后、处理前被删除，是正常情况
-                    logger.debug(f"检查会话 {session_id} 时，会话已被移除。")
-                except Exception as e:
-                    logger.error(
-                        f"检查或总结会话 {session_id} 时发生错误: {e}", exc_info=True
-                    )
-
-        except asyncio.CancelledError:
-            logger.info("定期总结检查任务被取消。")
-            break  # 退出循环
-        except Exception as e:
-            # 捕获循环本身的意外错误，防止任务完全停止
-            logger.error(f"定期总结检查任务主循环发生错误: {e}", exc_info=True)
-            # 可以选择在这里稍微等待一下，避免错误刷屏
-            await asyncio.sleep(plugin.summary_check_interval)
+# Summarization functions (_check_summary_prerequisites, _get_summary_llm_response,
+# _extract_summary_text, _store_summary_to_milvus, handle_summary_long_memory,
+# _periodic_summarization_check) have been moved to core.summarization_service.py
+# （占位注释，实际代码已删除）
