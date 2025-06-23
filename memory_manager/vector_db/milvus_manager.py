@@ -951,7 +951,7 @@ class MilvusManager:
                 logger.info(f"集合 '{collection_name}' 已加载。")
                 return True
         except Exception as e:
-            if e.code == 101:  # 集合未加载
+            if hasattr(e, 'code') and e.code == 101:  # 集合未加载
                 logger.warning(f"集合 '{collection_name}' 尚未加载，将尝试加载。")
             else:
                 logger.error(

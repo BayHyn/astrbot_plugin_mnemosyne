@@ -289,7 +289,7 @@ class VectorDatabaseFactory:
             # 获取源集合的所有数据
             all_data = source_db.query(
                 collection_name=collection_name,
-                filters="memory_id >= 0",  # 获取所有记录
+                expression="memory_id >= 0",  # 获取所有记录
                 output_fields=["*"],  # 获取所有字段
                 limit=None,
             )

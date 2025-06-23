@@ -71,7 +71,6 @@ class Mnemosyne(Star):
         self.provider = None
 
         # 初始化状态标志
-        self.embedding_adapter = None
         self._embedding_init_attempted = False
         self._core_components_initialized = False
 
