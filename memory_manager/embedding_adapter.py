@@ -7,8 +7,8 @@
 import asyncio
 from typing import List, Optional
 from abc import ABC, abstractmethod
-
-from astrbot.core.log import LogManager
+from astrbot.api.star import Context
+from astrbot.api import logger
 from astrbot.core.provider.provider import EmbeddingProvider
 
 
@@ -20,7 +20,6 @@ class EmbeddingServiceAdapter(ABC):
 
     def __init__(self, service_name: str):
         self.service_name = service_name
-        self.logger = LogManager.GetLogger(log_name=f"EmbeddingAdapter-{service_name}")
 
     @abstractmethod
     async def get_embedding(self, text: str) -> List[float]:
@@ -48,22 +47,22 @@ class EmbeddingServiceAdapter(ABC):
         pass
 
 
-class AstrBotEmbeddingAdapter(EmbeddingServiceAdapter):
+class AstrBotEmbeddingAdapter(EmbeddingProvider):
     """
     AstrBot 原生 EmbeddingProvider 适配器
     """
 
     def __init__(self, provider: EmbeddingProvider):
-        super().__init__("AstrBot-Native")
         self.provider = provider
-        self.logger.info("Initialized AstrBot native embedding adapter")
+        self.service_name = "astrbot_native"
+        logger.info("Initialized AstrBot native embedding adapter")
 
     async def get_embedding(self, text: str) -> List[float]:
         """获取单个文本的嵌入向量"""
         try:
             return await self.provider.get_embedding(text)
         except Exception as e:
-            self.logger.error(f"Failed to get embedding: {e}", exc_info=True)
+            logger.error(f"Failed to get embedding: {e}", exc_info=True)
             raise
 
     async def get_embeddings(self, texts: List[str]) -> List[List[float]]:
@@ -71,7 +70,7 @@ class AstrBotEmbeddingAdapter(EmbeddingServiceAdapter):
         try:
             return await self.provider.get_embeddings(texts)
         except Exception as e:
-            self.logger.error(f"Failed to get embeddings: {e}", exc_info=True)
+            logger.error(f"Failed to get embeddings: {e}", exc_info=True)
             raise
 
     def get_dim(self) -> int:
@@ -94,7 +93,7 @@ class AstrBotEmbeddingAdapter(EmbeddingServiceAdapter):
             await self.get_embedding(test_text)
             return True
         except Exception as e:
-            self.logger.error(f"Connection test failed: {e}")
+            logger.error(f"Connection test failed: {e}")
             return False
 
 
@@ -104,70 +103,70 @@ class LegacyEmbeddingAdapter(EmbeddingServiceAdapter):
     """
 
     def __init__(self, embedding_service, service_name: str):
-        super().__init__(f"Legacy-{service_name}")
-        self.embedding_service = embedding_service
-        self.logger.info(f"Initialized legacy embedding adapter for {service_name}")
+        self.provider = embedding_service
+        self.service_name = "legacy_" + service_name
+        logger.info(f"Initialized legacy embedding adapter for {service_name}")
 
     async def get_embedding(self, text: str) -> List[float]:
         """获取单个文本的嵌入向量"""
         try:
             # 检查是否是异步方法
-            if asyncio.iscoroutinefunction(self.embedding_service.get_embeddings):
-                embeddings = await self.embedding_service.get_embeddings([text])
+            if asyncio.iscoroutinefunction(self.provider.get_embeddings):
+                embeddings = await self.provider.get_embeddings([text])
             else:
                 # 在线程池中运行同步方法
                 embeddings = await asyncio.get_event_loop().run_in_executor(
-                    None, self.embedding_service.get_embeddings, [text]
+                    None, self.provider.get_embeddings, [text]
                 )
             return embeddings[0] if embeddings else []
         except Exception as e:
-            self.logger.error(f"Failed to get embedding: {e}", exc_info=True)
+            logger.error(f"Failed to get embedding: {e}", exc_info=True)
             raise
 
     async def get_embeddings(self, texts: List[str]) -> List[List[float]]:
         """批量获取文本的嵌入向量"""
         try:
             # 检查是否是异步方法
-            if asyncio.iscoroutinefunction(self.embedding_service.get_embeddings):
-                return await self.embedding_service.get_embeddings(texts)
+            if asyncio.iscoroutinefunction(self.provider.get_embeddings):
+                return await self.provider.get_embeddings(texts)
             else:
                 # 在线程池中运行同步方法
                 return await asyncio.get_event_loop().run_in_executor(
-                    None, self.embedding_service.get_embeddings, texts
+                    None, self.provider.get_embeddings, texts
                 )
         except Exception as e:
-            self.logger.error(f"Failed to get embeddings: {e}", exc_info=True)
+            logger.error(f"Failed to get embeddings: {e}", exc_info=True)
             raise
 
     def get_dim(self) -> int:
         """获取向量维度"""
-        if hasattr(self.embedding_service, "get_dim"):
-            return self.embedding_service.get_dim()
-        elif hasattr(self.embedding_service, "dimension"):
-            return self.embedding_service.dimension
+        if hasattr(self.provider, "get_dim"):
+            return self.provider.get_dim()
+        elif hasattr(self.provider, "dimension"):
+            return self.provider.dimension
         else:
             # 默认维度
             return 1024
 
     def get_model_name(self) -> str:
         """获取模型名称"""
-        if hasattr(self.embedding_service, "model"):
-            return self.embedding_service.model
-        elif hasattr(self.embedding_service, "get_model_name"):
-            return self.embedding_service.get_model_name()
+        if hasattr(self.provider, "model"):
+            return self.provider.model
+        elif hasattr(self.provider, "get_model_name"):
+            return self.provider.get_model_name()
         else:
             return "unknown"
 
     async def test_connection(self) -> bool:
         """测试连接是否正常"""
         try:
-            if hasattr(self.embedding_service, "test_connection"):
+            if hasattr(self.provider, "test_connection"):
                 # 检查是否是异步方法
-                if asyncio.iscoroutinefunction(self.embedding_service.test_connection):
-                    return await self.embedding_service.test_connection()
+                if asyncio.iscoroutinefunction(self.provider.test_connection):
+                    return await self.provider.test_connection()
                 else:
                     return await asyncio.get_event_loop().run_in_executor(
-                        None, self.embedding_service.test_connection
+                        None, self.provider.test_connection
                     )
             else:
                 # 通过实际调用来测试
@@ -175,7 +174,7 @@ class LegacyEmbeddingAdapter(EmbeddingServiceAdapter):
                 await self.get_embedding(test_text)
                 return True
         except Exception as e:
-            self.logger.error(f"Connection test failed: {e}")
+            logger.error(f"Connection test failed: {e}")
             return False
 
 
@@ -186,35 +185,29 @@ class EmbeddingServiceFactory:
     """
 
     @staticmethod
-    def create_adapter(
-        context, config: dict, logger: Optional[LogManager] = None
-    ) -> Optional[EmbeddingServiceAdapter]:
+    def create_adapter(context, config: dict) -> Optional[EmbeddingServiceAdapter]:
         """
         创建嵌入服务适配器
 
         Args:
             context: AstrBot 上下文
             config: 插件配置
-            logger: 日志记录器
 
         Returns:
             EmbeddingServiceAdapter 实例或 None
         """
-        if logger is None:
-            logger = LogManager.GetLogger(log_name="EmbeddingServiceFactory")
 
         try:
             # 1. 优先尝试使用 AstrBot 原生 EmbeddingProvider
             native_adapter = EmbeddingServiceFactory._try_native_provider(
-                context, config, logger
+                context, config
             )
+            # print(native_adapter)
             if native_adapter:
                 return native_adapter
 
             # 2. 回退到传统实现
-            legacy_adapter = EmbeddingServiceFactory._try_legacy_provider(
-                config, logger
-            )
+            legacy_adapter = EmbeddingServiceFactory._try_legacy_provider(config)
             if legacy_adapter:
                 return legacy_adapter
 
@@ -229,56 +222,28 @@ class EmbeddingServiceFactory:
 
     @staticmethod
     def _try_native_provider(
-        context, config: dict, logger
+        context: Context, config: dict
     ) -> Optional[AstrBotEmbeddingAdapter]:
         """尝试使用 AstrBot 原生 EmbeddingProvider"""
+
         try:
-            # 检查是否有可用的 embedding provider
-            if not hasattr(context, "provider_manager") or not context.provider_manager:
-                logger.debug("No provider manager available")
+            astrbot_embedding_provider_id = config.get("embedding_provider_id")
+            # print(astrbot_embedding_provider_id)
+            if not astrbot_embedding_provider_id:
+                logger.debug("No embedding provider ID specified")
                 return None
 
-            # 尝试根据配置选择特定的 provider
-            preferred_provider_id = config.get("embedding_provider_id")
-            if preferred_provider_id:
-                # 尝试通过 inst_map 获取指定的提供商
-                if hasattr(context.provider_manager, "inst_map"):
-                    provider = context.provider_manager.inst_map.get(preferred_provider_id)
-                    if provider and hasattr(provider, "get_embedding"):
-                        logger.info(
-                            f"Using preferred embedding provider: {preferred_provider_id}"
-                        )
-                        return AstrBotEmbeddingAdapter(provider)
-
-            # 尝试获取所有可用的嵌入服务提供商
-            embedding_providers = []
-
-            # 方法1：通过 embedding_provider_insts 属性
-            if hasattr(context.provider_manager, "embedding_provider_insts"):
-                embedding_providers = context.provider_manager.embedding_provider_insts
-
-            # 方法2：通过 inst_map 查找嵌入服务
-            elif hasattr(context.provider_manager, "inst_map"):
-                for provider_id, provider in context.provider_manager.inst_map.items():
-                    if hasattr(provider, "get_embedding"):
-                        embedding_providers.append(provider)
-                        logger.debug(f"Found embedding provider: {provider_id}")
-
-            if not embedding_providers:
-                logger.debug("No embedding providers available")
-                return None
-
-            # 使用第一个可用的 embedding provider
-            provider = embedding_providers[0]
-            logger.info("Using first available embedding provider")
-            return AstrBotEmbeddingAdapter(provider)
-
+            embedding_provider = context.get_provider_by_id(
+                astrbot_embedding_provider_id
+            )
+            # print(embedding_provider)
+            return AstrBotEmbeddingAdapter(embedding_provider)
         except Exception as e:
             logger.debug(f"Failed to create native embedding adapter: {e}")
             return None
 
     @staticmethod
-    def _try_legacy_provider(config: dict, logger) -> Optional[LegacyEmbeddingAdapter]:
+    def _try_legacy_provider(config: dict) -> Optional[LegacyEmbeddingAdapter]:
         """尝试使用传统嵌入服务实现"""
         try:
             # 检查必要的配置

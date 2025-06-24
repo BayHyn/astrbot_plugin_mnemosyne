@@ -17,6 +17,7 @@ from .constants import PRIMARY_FIELD_NAME, MAX_TOTAL_FETCH_RECORDS
 # 导入迁移相关模块
 from ..memory_manager.vector_db import VectorDatabaseFactory
 from ..memory_manager.embedding_adapter import EmbeddingServiceFactory
+from astrbot.api import logger
 
 # 类型提示
 if TYPE_CHECKING:
@@ -26,7 +27,7 @@ if TYPE_CHECKING:
 async def list_collections_cmd_impl(self: "Mnemosyne", event: AstrMessageEvent):
     """[实现] 列出当前向量数据库实例中的所有集合"""
     if not self.vector_db or not self.vector_db.is_connected():
-        db_type = self.vector_db.get_database_type().value if self.vector_db else "向量数据库"
+        db_type = self._get_database_type_safe() if self.vector_db else "向量数据库"
         yield event.plain_result(f"⚠️ {db_type} 服务未初始化或未连接。")
         return
     try:
@@ -35,10 +36,10 @@ async def list_collections_cmd_impl(self: "Mnemosyne", event: AstrMessageEvent):
             yield event.plain_result("⚠️ 获取集合列表失败，请检查日志。")
             return
         if not collections:
-            db_type = self.vector_db.get_database_type().value
+            db_type = self._get_database_type_safe()
             response = f"当前 {db_type} 实例中没有找到任何集合。"
         else:
-            db_type = self.vector_db.get_database_type().value
+            db_type = self._get_database_type_safe()
             response = f"当前 {db_type} 实例中的集合列表：\n" + "\n".join(
                 [f"📚 {col}" for col in collections]
             )
@@ -50,7 +51,7 @@ async def list_collections_cmd_impl(self: "Mnemosyne", event: AstrMessageEvent):
                 )
         yield event.plain_result(response)
     except Exception as e:
-        self.logger.error(f"执行 'memory list' 命令失败: {str(e)}", exc_info=True)
+        logger.error(f"执行 'memory list' 命令失败: {str(e)}", exc_info=True)
         yield event.plain_result(f"⚠️ 获取集合列表时出错: {str(e)}")
 
 
@@ -62,7 +63,7 @@ async def delete_collection_cmd_impl(
 ):
     """[实现] 删除指定的向量数据库集合及其所有数据"""
     if not self.vector_db or not self.vector_db.is_connected():
-        db_type = self.vector_db.get_database_type().value if self.vector_db else "向量数据库"
+        db_type = self._get_database_type_safe() if self.vector_db else "向量数据库"
         yield event.plain_result(f"⚠️ {db_type} 服务未初始化或未连接。")
         return
 
@@ -71,7 +72,7 @@ async def delete_collection_cmd_impl(
     if is_current_collection:
         warning_msg = f"\n\n🔥🔥🔥 警告：您正在尝试删除当前插件正在使用的集合 '{collection_name}'！这将导致插件功能异常，直到重新创建或更改配置！ 🔥🔥🔥"
 
-    db_type = self.vector_db.get_database_type().value
+    db_type = self._get_database_type_safe()
     if confirm != "--confirm":
         yield event.plain_result(
             f"⚠️ 操作确认 ⚠️\n"
@@ -84,11 +85,9 @@ async def delete_collection_cmd_impl(
 
     try:
         sender_id = event.get_sender_id()
-        self.logger.warning(
-            f"管理员 {sender_id} 请求删除集合: {collection_name} (确认执行)"
-        )
+        logger.warning(f"管理员 {sender_id} 请求删除集合: {collection_name} (确认执行)")
         if is_current_collection:
-            self.logger.critical(
+            logger.critical(
                 f"管理员 {sender_id} 正在删除当前插件使用的集合 '{collection_name}'！"
             )
 
@@ -98,9 +97,9 @@ async def delete_collection_cmd_impl(
             if is_current_collection:
                 msg += "\n插件使用的集合已被删除，请尽快处理！"
             yield event.plain_result(msg)
-            self.logger.warning(f"管理员 {sender_id} 成功删除了集合: {collection_name}")
+            logger.warning(f"管理员 {sender_id} 成功删除了集合: {collection_name}")
             if is_current_collection:
-                self.logger.error(
+                logger.error(
                     f"插件当前使用的集合 '{collection_name}' 已被删除，相关功能将不可用。"
                 )
         else:
@@ -109,7 +108,7 @@ async def delete_collection_cmd_impl(
             )
 
     except Exception as e:
-        self.logger.error(
+        logger.error(
             f"执行 'memory drop_collection {collection_name}' 命令时发生严重错误: {str(e)}",
             exc_info=True,
         )
@@ -124,7 +123,7 @@ async def list_records_cmd_impl(
 ):
     """[实现] 查询指定集合的最新记忆记录 (按创建时间倒序，自动获取最新)"""
     if not self.vector_db or not self.vector_db.is_connected():
-        db_type = self.vector_db.get_database_type().value if self.vector_db else "向量数据库"
+        db_type = self._get_database_type_safe() if self.vector_db else "向量数据库"
         yield event.plain_result(f"⚠️ {db_type} 服务未初始化或未连接。")
         return
 
@@ -151,18 +150,18 @@ async def list_records_cmd_impl(
         if session_id:
             # 如果有会话ID，则按会话ID过滤
             expr = f'session_id in ["{session_id}"]'
-            self.logger.info(
+            logger.info(
                 f"将按会话 ID '{session_id}' 过滤并查询所有相关记录 (上限 {MAX_TOTAL_FETCH_RECORDS} 条)。"
             )
         else:
             # 如果没有会话ID上下文，查询所有记录
             expr = f"{PRIMARY_FIELD_NAME} >= 0"
-            self.logger.info(
+            logger.info(
                 "未指定会话 ID，将查询集合 '{target_collection}' 中的所有记录 (上限 {MAX_TOTAL_FETCH_RECORDS} 条)。"
             )
             # 或者，如果您的 milvus_manager 支持空表达式查询所有，则 expr = "" 或 None
 
-        # self.logger.debug(f"查询集合 '{target_collection}' 记录: expr='{expr}'") # 上面已有更具体的日志
+        # logger.debug(f"查询集合 '{target_collection}' 记录: expr='{expr}'") # 上面已有更具体的日志
         output_fields = [
             "content",
             "create_time",
@@ -171,7 +170,7 @@ async def list_records_cmd_impl(
             PRIMARY_FIELD_NAME,
         ]
 
-        self.logger.debug(
+        logger.debug(
             f"准备查询 Milvus: 集合='{target_collection}', 表达式='{expr}', 限制={limit},输出字段={output_fields}, 总数上限={MAX_TOTAL_FETCH_RECORDS}"
         )
 
@@ -195,7 +194,7 @@ async def list_records_cmd_impl(
         # 检查查询结果
         if fetched_records is None:
             # 查询失败，vector_db.query 通常会返回 None 或抛出异常
-            self.logger.error(
+            logger.error(
                 f"查询集合 '{target_collection}' 失败，vector_db.query 返回 None。"
             )
             yield event.plain_result(
@@ -206,7 +205,7 @@ async def list_records_cmd_impl(
         if not fetched_records:
             # 查询成功，但没有返回任何记录
             session_filter_msg = f"在会话 '{session_id}' 中" if session_id else ""
-            self.logger.info(
+            logger.info(
                 f"集合 '{target_collection}' {session_filter_msg} 没有找到任何匹配的记忆记录。"
             )
             yield event.plain_result(
@@ -215,14 +214,14 @@ async def list_records_cmd_impl(
             return
         # 检查是否达到了总数上限
         if len(fetched_records) >= MAX_TOTAL_FETCH_RECORDS:
-            self.logger.warning(
+            logger.warning(
                 f"查询到的记录数量达到总数上限 ({MAX_TOTAL_FETCH_RECORDS})，可能存在更多未获取的记录，导致无法找到更旧的记录，但最新记录应该在获取范围内。"
             )
             yield event.plain_result(
                 f"ℹ️ 警告：查询到的记录数量已达到系统获取最新记录的上限 ({MAX_TOTAL_FETCH_RECORDS})。如果记录非常多，可能无法显示更旧的内容，但最新记录应该已包含在内。"
             )
 
-        self.logger.debug(f"成功获取到 {len(fetched_records)} 条原始记录用于排序。")
+        logger.debug(f"成功获取到 {len(fetched_records)} 条原始记录用于排序。")
         # --- 在获取全部结果后进行排序 (按创建时间倒序) ---
         # 这确保了排序是基于所有获取到的记录，找到真正的最新记录
         try:
@@ -230,11 +229,11 @@ async def list_records_cmd_impl(
             fetched_records.sort(
                 key=lambda x: x.get("create_time", 0) or 0, reverse=True
             )
-            self.logger.debug(
+            logger.debug(
                 f"已将获取到的 {len(fetched_records)} 条记录按 create_time 降序排序。"
             )
         except Exception as sort_e:
-            self.logger.warning(
+            logger.warning(
                 f"对查询结果进行排序时出错: {sort_e}。显示顺序可能不按时间排序。"
             )
             # 如果排序失败，继续处理，但不保证按时间顺序
@@ -267,7 +266,7 @@ async def list_records_cmd_impl(
                 )
             except (TypeError, ValueError, OSError) as time_e:
                 # 处理无效或无法解析的时间戳
-                self.logger.warning(
+                logger.warning(
                     f"记录 {record.get(PRIMARY_FIELD_NAME, '未知ID')} 的时间戳 '{ts}' 无效或解析错误: {time_e}"
                 )
                 time_str = f"无效时间戳({ts})" if ts is not None else "未知时间"
@@ -292,7 +291,7 @@ async def list_records_cmd_impl(
 
     except Exception as e:
         # 捕获所有其他潜在异常
-        self.logger.error(
+        logger.error(
             f"执行 'memory list_records' 命令时发生意外错误 (集合: {target_collection}): {str(e)}",
             exc_info=True,  # 记录完整的错误堆栈
         )
@@ -307,7 +306,7 @@ async def delete_session_memory_cmd_impl(
 ):
     """[实现] 删除指定会话 ID 相关的所有记忆信息"""
     if not self.vector_db or not self.vector_db.is_connected():
-        db_type = self.vector_db.get_database_type().value if self.vector_db else "向量数据库"
+        db_type = self._get_database_type_safe() if self.vector_db else "向量数据库"
         yield event.plain_result(f"⚠️ {db_type} 服务未初始化或未连接。")
         return
 
@@ -330,7 +329,7 @@ async def delete_session_memory_cmd_impl(
         collection_name = self.collection_name
         expr = f'session_id == "{session_id_to_delete}"'
         sender_id = event.get_sender_id()
-        self.logger.warning(
+        logger.warning(
             f"管理员 {sender_id} 请求删除会话 '{session_id_to_delete}' 的所有记忆 (集合: {collection_name}, 表达式: '{expr}') (确认执行)"
         )
 
@@ -344,22 +343,20 @@ async def delete_session_memory_cmd_impl(
                 if hasattr(mutation_result, "delete_count")
                 else "未知"
             )
-            self.logger.info(
+            logger.info(
                 f"已发送删除会话 '{session_id_to_delete}' 记忆的请求。返回的删除计数（可能不准确）: {delete_pk_count}"
             )
             try:
-                self.logger.info(
-                    f"正在刷新集合 '{collection_name}' 以应用删除操作..."
-                )
+                logger.info(f"正在刷新集合 '{collection_name}' 以应用删除操作...")
                 # 对于 FAISS，flush 操作可能不需要，但保持接口一致性
-                if hasattr(self.vector_db, 'flush'):
+                if hasattr(self.vector_db, "flush"):
                     self.vector_db.flush([collection_name])
-                self.logger.info(f"集合 '{collection_name}' 刷新完成。删除操作已生效。")
+                logger.info(f"集合 '{collection_name}' 刷新完成。删除操作已生效。")
                 yield event.plain_result(
                     f"✅ 已成功删除会话 ID '{session_id_to_delete}' 的所有记忆信息。"
                 )
             except Exception as flush_err:
-                self.logger.error(
+                logger.error(
                     f"刷新集合 '{collection_name}' 以应用删除时出错: {flush_err}",
                     exc_info=True,
                 )
@@ -367,13 +364,13 @@ async def delete_session_memory_cmd_impl(
                     f"⚠️ 已发送删除请求，但在刷新集合使更改生效时出错: {flush_err}。删除可能未完全生效。"
                 )
         else:
-            db_type = self.vector_db.get_database_type().value
+            db_type = self._get_database_type_safe()
             yield event.plain_result(
                 f"⚠️ 删除会话 ID '{session_id_to_delete}' 记忆的请求失败。请检查 {db_type} 日志。"
             )
 
     except Exception as e:
-        self.logger.error(
+        logger.error(
             f"执行 'memory delete_session_memory' 命令时发生严重错误 (Session ID: {session_id_to_delete}): {str(e)}",
             exc_info=True,
         )
@@ -392,13 +389,11 @@ async def get_session_id_cmd_impl(self: "Mnemosyne", event: AstrMessageEvent):
             yield event.plain_result(
                 "🤔 无法获取当前会话 ID。可能还没有开始对话，或者会话已结束/失效。"
             )
-            self.logger.warning(
+            logger.warning(
                 f"用户 {event.get_sender_id()} 在 {event.unified_msg_origin} 尝试获取 session_id 失败。"
             )
     except Exception as e:
-        self.logger.error(
-            f"执行 'memory get_session_id' 命令失败: {str(e)}", exc_info=True
-        )
+        logger.error(f"执行 'memory get_session_id' 命令失败: {str(e)}", exc_info=True)
         yield event.plain_result(f"⚠️ 获取当前会话 ID 时发生错误: {str(e)}")
 
 
@@ -456,7 +451,7 @@ async def migration_status_cmd_impl(self: "Mnemosyne", event: AstrMessageEvent):
         yield event.plain_result(response)
 
     except Exception as e:
-        self.logger.error(f"获取迁移状态失败: {e}", exc_info=True)
+        logger.error(f"获取迁移状态失败: {e}", exc_info=True)
         yield event.plain_result(f"⚠️ 获取状态信息时发生错误: {str(e)}")
 
 
@@ -520,7 +515,7 @@ async def migrate_config_cmd_impl(self: "Mnemosyne", event: AstrMessageEvent):
         yield event.plain_result("\n⚠️ 注意：配置已更新，建议重启插件以应用更改。")
 
     except Exception as e:
-        self.logger.error(f"配置迁移失败: {e}", exc_info=True)
+        logger.error(f"配置迁移失败: {e}", exc_info=True)
         yield event.plain_result(f"⚠️ 配置迁移失败: {str(e)}")
 
 
@@ -559,8 +554,12 @@ async def migrate_to_faiss_cmd_impl(
         current_faiss_config = self.config.get("faiss_config", {})
         faiss_config = {
             "faiss_config": {
-                "faiss_data_path": current_faiss_config.get("faiss_data_path", "faiss_data"),
-                "faiss_index_type": current_faiss_config.get("faiss_index_type", "IndexFlatL2"),
+                "faiss_data_path": current_faiss_config.get(
+                    "faiss_data_path", "faiss_data"
+                ),
+                "faiss_index_type": current_faiss_config.get(
+                    "faiss_index_type", "IndexFlatL2"
+                ),
                 "faiss_nlist": current_faiss_config.get("faiss_nlist", 100),
             }
         }
@@ -575,30 +574,83 @@ async def migrate_to_faiss_cmd_impl(
         # 执行数据迁移
         yield event.plain_result(f"📋 开始迁移集合 '{self.collection_name}' 的数据...")
 
-        # 在后台执行迁移
-        success = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: VectorDatabaseFactory.migrate_data(
-                source_db=self.vector_db,
-                target_db=target_db,
-                collection_name=self.collection_name,
-                batch_size=1000,
-            ),
-        )
+        # 先检查源数据库状态
+        try:
+            source_stats = self.vector_db.get_collection_stats(self.collection_name)
+            record_count = source_stats.get("row_count", 0)
+            yield event.plain_result(f"📊 源数据库记录数: {record_count}")
 
-        if success:
-            # 更新配置
-            self.config["vector_database_type"] = "faiss"
-            yield event.plain_result("✅ 数据迁移成功！")
-            yield event.plain_result("⚠️ 请重启插件以使用新的 FAISS 数据库。")
-        else:
-            yield event.plain_result("❌ 数据迁移失败，请查看日志获取详细信息。")
+            if record_count == 0:
+                yield event.plain_result("⚠️ 源集合为空，无数据需要迁移")
+                # 仍然更新配置，因为迁移在技术上是成功的
+                self.config["vector_database_type"] = "faiss"
+                yield event.plain_result("✅ 配置已更新为 FAISS 数据库")
+                yield event.plain_result("⚠️ 请重启插件以使用新的 FAISS 数据库。")
+                return
+
+        except Exception as e:
+            yield event.plain_result(f"⚠️ 无法获取源数据库统计信息: {e}")
+
+        # 定义进度回调函数
+        async def progress_callback(progress_info):
+            """迁移进度回调"""
+            batch_num = progress_info["batch_num"]
+            batch_count = progress_info["batch_count"]
+            progress_percent = progress_info["progress_percent"]
+            migrated_count = progress_info["migrated_count"]
+            total_records = progress_info["total_records"]
+
+            # 每10个批次或重要进度点发送更新
+            if batch_num % 10 == 0 or progress_percent >= 100:
+                yield event.plain_result(
+                    f"📊 迁移进度: {batch_num}/{batch_count} 批次 | "
+                    f"{migrated_count}/{total_records} 记录 ({progress_percent:.1f}%)"
+                )
+
+        # 使用 asyncio.create_task 执行异步迁移
+        try:
+            migration_task = asyncio.create_task(
+                VectorDatabaseFactory.migrate_data_async(
+                    source_db=self.vector_db,
+                    target_db=target_db,
+                    collection_name=self.collection_name,
+                    batch_size=1000,
+                    progress_callback=progress_callback,
+                )
+            )
+
+            # 等待迁移完成
+            success = await migration_task
+
+            if success:
+                # 更新配置
+                self.config["vector_database_type"] = "faiss"
+                yield event.plain_result("✅ 数据迁移成功！")
+                yield event.plain_result("⚠️ 请重启插件以使用新的 FAISS 数据库。")
+
+                # 验证迁移结果
+                try:
+                    target_stats = target_db.get_collection_stats(self.collection_name)
+                    target_count = target_stats.get("row_count", 0)
+                    yield event.plain_result(f"📊 目标数据库记录数: {target_count}")
+                except Exception as e:
+                    yield event.plain_result(f"⚠️ 无法验证目标数据库: {e}")
+            else:
+                yield event.plain_result("❌ 数据迁移失败，请查看日志获取详细信息。")
+                yield event.plain_result(
+                    "💡 提示: 检查 AstrBot 日志中的 'DatabaseMigration' 相关信息"
+                )
+
+        except Exception as migration_error:
+            logger.error(f"迁移执行异常: {migration_error}", exc_info=True)
+            yield event.plain_result(f"❌ 迁移执行异常: {str(migration_error)}")
+            yield event.plain_result("💡 提示: 这可能是兼容性问题，请检查数据格式")
 
         # 断开目标数据库连接
         target_db.disconnect()
 
     except Exception as e:
-        self.logger.error(f"迁移到 FAISS 失败: {e}", exc_info=True)
+        logger.error(f"迁移到 FAISS 失败: {e}", exc_info=True)
         yield event.plain_result(f"⚠️ 迁移过程中发生错误: {str(e)}")
 
 
@@ -650,16 +702,35 @@ async def migrate_to_milvus_cmd_impl(
         # 执行数据迁移
         yield event.plain_result(f"📋 开始迁移集合 '{self.collection_name}' 的数据...")
 
-        # 在后台执行迁移
-        success = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: VectorDatabaseFactory.migrate_data(
+        # 定义进度回调函数
+        async def progress_callback(progress_info):
+            """迁移进度回调"""
+            batch_num = progress_info["batch_num"]
+            batch_count = progress_info["batch_count"]
+            progress_percent = progress_info["progress_percent"]
+            migrated_count = progress_info["migrated_count"]
+            total_records = progress_info["total_records"]
+
+            # 每10个批次或重要进度点发送更新
+            if batch_num % 10 == 0 or progress_percent >= 100:
+                yield event.plain_result(
+                    f"📊 迁移进度: {batch_num}/{batch_count} 批次 | "
+                    f"{migrated_count}/{total_records} 记录 ({progress_percent:.1f}%)"
+                )
+
+        # 使用 asyncio.create_task 执行异步迁移
+        migration_task = asyncio.create_task(
+            VectorDatabaseFactory.migrate_data_async(
                 source_db=self.vector_db,
                 target_db=target_db,
                 collection_name=self.collection_name,
                 batch_size=1000,
-            ),
+                progress_callback=progress_callback,
+            )
         )
+
+        # 等待迁移完成
+        success = await migration_task
 
         if success:
             # 更新配置
@@ -673,7 +744,7 @@ async def migrate_to_milvus_cmd_impl(
         target_db.disconnect()
 
     except Exception as e:
-        self.logger.error(f"迁移到 Milvus 失败: {e}", exc_info=True)
+        logger.error(f"迁移到 Milvus 失败: {e}", exc_info=True)
         yield event.plain_result(f"⚠️ 迁移过程中发生错误: {str(e)}")
 
 
@@ -720,14 +791,14 @@ async def validate_config_cmd_impl(self: "Mnemosyne", event: AstrMessageEvent):
             yield event.plain_result("\n⚠️ 发现配置问题，请根据上述提示进行修复。")
 
     except Exception as e:
-        self.logger.error(f"配置验证失败: {e}", exc_info=True)
+        logger.error(f"配置验证失败: {e}", exc_info=True)
         yield event.plain_result(f"⚠️ 配置验证过程中发生错误: {str(e)}")
 
 
 async def help_cmd_impl(self: "Mnemosyne", event: AstrMessageEvent):
     """[实现] 显示帮助信息"""
     # 获取当前数据库类型以提供更准确的帮助信息
-    db_type = self.vector_db.get_database_type().value if self.vector_db else "向量数据库"
+    db_type = self._get_database_type_safe() if self.vector_db else "向量数据库"
     help_text = f"""🧠 Mnemosyne 长期记忆插件 v0.6.0
 当前数据库: {db_type}
 
@@ -746,6 +817,13 @@ async def help_cmd_impl(self: "Mnemosyne", event: AstrMessageEvent):
   /memory migrate_to_faiss [--confirm] - 迁移到FAISS数据库
   /memory migrate_to_milvus [--confirm] - 迁移到Milvus数据库
 
+🌐 Web界面管理 (管理员):
+  /memory web_start - 启动Web可视化界面
+  /memory web_stop - 停止Web可视化界面
+  /memory web_status - 查看Web界面状态
+  /memory web_keepalive - 重置Web界面空闲时间
+  /memory web_cleanup - 清理Web界面资源并重置
+
 🗑️ 数据管理 (管理员):
   /memory drop_collection <集合名> [--confirm] - 删除集合
   /memory delete_session_memory <会话ID> [--confirm] - 删除会话记忆
@@ -760,6 +838,13 @@ async def help_cmd_impl(self: "Mnemosyne", event: AstrMessageEvent):
 ✨ 支持多种向量数据库 (Milvus + FAISS)
 ✨ 集成AstrBot原生嵌入服务
 ✨ 一键配置和数据迁移
-✨ 改进的错误处理和日志"""
+✨ Web可视化管理界面
+✨ 改进的错误处理和日志
+
+💡 Web界面使用提示:
+- 启用Web界面: 在配置中设置 web_interface.enabled = true
+- 启动界面: /memory web_start
+- 访问地址: http://127.0.0.1:8765 (默认)
+- 安全认证: 支持访问令牌保护"""
 
     yield event.plain_result(help_text)

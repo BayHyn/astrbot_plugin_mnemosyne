@@ -179,5 +179,69 @@
         "description":"对话总结提示词",
         "type":"string",
         "default":"请基于以下对话内容生成一段连贯的总结性文字，要求：1. 使用单段自然语言表述，不加序号或分点；2. 聚焦提取核心要素，包括但不限于参与者身份（姓名/角色）、核心事件、关键时间节点、特殊需求、争议点及解决方案；3. 保留涉及金额/数量/规格等量化信息；4.不输出多余的解释性内容；5. 用简洁书面语整合信息，确保信息完整准确。注意：避免添加解释性内容，仅客观呈现对话要素的整合结果。6.以AI的第一人称视角记录信息"
+    },
+    "web_interface":{
+        "description":"Web可视化界面配置",
+        "type":"object",
+        "hint":"记忆数据的Web可视化管理界面",
+        "obvious_hint":true,
+        "items":{
+            "enabled":{
+                "description":"是否启用Web界面",
+                "type":"bool",
+                "hint":"启用后可通过浏览器访问记忆管理界面",
+                "obvious_hint":true,
+                "default":false
+            },
+            "host":{
+                "description":"Web服务器监听地址",
+                "type":"string",
+                "hint":"127.0.0.1 仅本机访问，0.0.0.0 允许外部访问",
+                "obvious_hint":true,
+                "default":"127.0.0.1"
+            },
+            "port":{
+                "description":"Web服务器端口",
+                "type":"int",
+                "hint":"Web界面访问端口，确保端口未被占用",
+                "obvious_hint":true,
+                "default":8765
+            },
+            "auth_enabled":{
+                "description":"是否启用访问认证",
+                "type":"bool",
+                "hint":"启用后需要访问令牌才能使用Web界面",
+                "obvious_hint":true,
+                "default":true
+            },
+            "access_token":{
+                "description":"访问令牌",
+                "type":"string",
+                "hint":"用于Web界面认证的访问令牌，留空将自动生成",
+                "obvious_hint":true,
+                "default":""
+            },
+            "auto_stop_enabled":{
+                "description":"是否启用自动停止",
+                "type":"bool",
+                "hint":"启用后Web服务器会在长时间无访问时自动停止",
+                "obvious_hint":true,
+                "default":true
+            },
+            "idle_timeout_minutes":{
+                "description":"空闲超时时间(分钟)",
+                "type":"int",
+                "hint":"Web服务器无访问多长时间后自动停止",
+                "obvious_hint":true,
+                "default":30
+            },
+            "auto_port_selection":{
+                "description":"是否启用自动端口选择",
+                "type":"bool",
+                "hint":"启用后如果指定端口被占用会自动选择可用端口",
+                "obvious_hint":true,
+                "default":true
+            }
+        }
     }
 }

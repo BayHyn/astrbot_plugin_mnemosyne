@@ -17,7 +17,7 @@ try:
 except ImportError:
     faiss = None
 
-from astrbot.core.log import LogManager
+from astrbot.api import logger
 from ..vector_db_base import VectorDatabase, VectorDatabaseType
 
 
@@ -53,17 +53,16 @@ class FaissManager(VectorDatabase):
         self.data_path = os.path.abspath(data_path)
         self.index_type = index_type
         self.nlist = nlist
-        self.logger = LogManager.GetLogger(log_name="FaissManager")
 
         # 存储集合信息
         self.collections: Dict[str, Dict[str, Any]] = {}
-        self.indexes: Dict[str, faiss.Index] = {} # type: ignore
+        self.indexes: Dict[str, faiss.Index] = {}  # type: ignore
         self.metadata: Dict[str, List[Dict[str, Any]]] = {}
 
         # 确保数据目录存在
         os.makedirs(self.data_path, exist_ok=True)
 
-        self.logger.info(f"FAISS Manager initialized with data path: {self.data_path}")
+        logger.info(f"FAISS Manager initialized with data path: {self.data_path}")
 
     def connect(self, **kwargs) -> bool:
         """
@@ -73,10 +72,10 @@ class FaissManager(VectorDatabase):
             self._load_collections_metadata()
             self._load_existing_collections()
             self._is_connected = True
-            self.logger.info("Successfully connected to FAISS database")
+            logger.info("Successfully connected to FAISS database")
             return True
         except Exception as e:
-            self.logger.error(f"Failed to connect to FAISS: {e}", exc_info=True)
+            logger.error(f"Failed to connect to FAISS: {e}", exc_info=True)
             return False
 
     def disconnect(self) -> bool:
@@ -87,10 +86,10 @@ class FaissManager(VectorDatabase):
             self._save_all_collections()
             self._save_collections_metadata()
             self._is_connected = False
-            self.logger.info("Successfully disconnected from FAISS database")
+            logger.info("Successfully disconnected from FAISS database")
             return True
         except Exception as e:
-            self.logger.error(f"Failed to disconnect from FAISS: {e}", exc_info=True)
+            logger.error(f"Failed to disconnect from FAISS: {e}", exc_info=True)
             return False
 
     def is_connected(self) -> bool:
@@ -110,7 +109,7 @@ class FaissManager(VectorDatabase):
         """
         try:
             if collection_name in self.collections:
-                self.logger.warning(f"Collection '{collection_name}' already exists")
+                logger.warning(f"Collection '{collection_name}' already exists")
                 return True
 
             # 从 schema 中提取向量维度
@@ -131,13 +130,13 @@ class FaissManager(VectorDatabase):
             self.indexes[collection_name] = index
             self.metadata[collection_name] = []
 
-            self.logger.info(
+            logger.info(
                 f"Created collection '{collection_name}' with dimension {vector_dim}"
             )
             return True
 
         except Exception as e:
-            self.logger.error(
+            logger.error(
                 f"Failed to create collection '{collection_name}': {e}", exc_info=True
             )
             return False
@@ -150,7 +149,7 @@ class FaissManager(VectorDatabase):
         """删除集合"""
         try:
             if collection_name not in self.collections:
-                self.logger.warning(f"Collection '{collection_name}' does not exist")
+                logger.warning(f"Collection '{collection_name}' does not exist")
                 return True
 
             # 删除内存中的数据
@@ -165,11 +164,11 @@ class FaissManager(VectorDatabase):
 
                 shutil.rmtree(collection_dir)
 
-            self.logger.info(f"Dropped collection '{collection_name}'")
+            logger.info(f"Dropped collection '{collection_name}'")
             return True
 
         except Exception as e:
-            self.logger.error(
+            logger.error(
                 f"Failed to drop collection '{collection_name}': {e}", exc_info=True
             )
             return False
@@ -215,7 +214,7 @@ class FaissManager(VectorDatabase):
                 metadata_records.append(record)
 
             if not vectors:
-                self.logger.warning("No valid vectors found in data")
+                logger.warning("No valid vectors found in data")
                 return False
 
             # 转换为 numpy 数组
@@ -231,13 +230,13 @@ class FaissManager(VectorDatabase):
             # 更新记录数
             self.collections[collection_name]["record_count"] += len(vectors)
 
-            self.logger.info(
+            logger.info(
                 f"Inserted {len(vectors)} records into collection '{collection_name}'"
             )
             return True
 
         except Exception as e:
-            self.logger.error(
+            logger.error(
                 f"Failed to insert data into collection '{collection_name}': {e}",
                 exc_info=True,
             )
@@ -247,7 +246,7 @@ class FaissManager(VectorDatabase):
         self,
         collection_name: str,
         query_vectors: List[List[float]],
-        top_k: int,
+        limit: int,
         filters: Optional[str] = None,
         output_fields: Optional[List[str]] = None,
         **kwargs,
@@ -258,7 +257,7 @@ class FaissManager(VectorDatabase):
         Args:
             collection_name: 集合名称
             query_vectors: 查询向量列表
-            top_k: 返回的最相似结果数量
+            limit: 返回的最相似结果数量
             filters: 过滤条件（简单的字符串表达式）
             output_fields: 返回的字段列表
             **kwargs: 额外参数
@@ -275,7 +274,7 @@ class FaissManager(VectorDatabase):
 
             # 执行 FAISS 搜索
             index = self.indexes[collection_name]
-            distances, indices = index.search(query_array, top_k)
+            distances, indices = index.search(query_array, limit)
 
             # 获取元数据
             collection_metadata = self.metadata[collection_name]
@@ -311,13 +310,13 @@ class FaissManager(VectorDatabase):
 
                 results.append(query_results)
 
-            self.logger.debug(
+            logger.debug(
                 f"Search in collection '{collection_name}' returned {len(results)} result sets"
             )
             return results
 
         except Exception as e:
-            self.logger.error(
+            logger.error(
                 f"Failed to search in collection '{collection_name}': {e}",
                 exc_info=True,
             )
@@ -326,8 +325,9 @@ class FaissManager(VectorDatabase):
     def query(
         self,
         collection_name: str,
-        filters: str,
-        output_fields: List[str],
+        expression: Optional[str] = None,
+        filters: Optional[str] = None,
+        output_fields: List[str] = None,
         limit: Optional[int] = None,
         **kwargs,
     ) -> List[Dict[str, Any]]:
@@ -336,7 +336,8 @@ class FaissManager(VectorDatabase):
 
         Args:
             collection_name: 集合名称
-            filters: 查询条件表达式
+            expression: 查询条件表达式 (Milvus风格)
+            filters: 查询条件表达式 (FAISS风格，向后兼容)
             output_fields: 返回的字段列表
             limit: 限制返回数量
             **kwargs: 额外参数
@@ -345,11 +346,18 @@ class FaissManager(VectorDatabase):
             if collection_name not in self.collections:
                 raise ValueError(f"Collection '{collection_name}' does not exist")
 
+            # 统一处理expression和filters参数
+            query_expression = expression or filters or ""
+
+            # 如果没有指定output_fields，返回所有字段
+            if output_fields is None:
+                output_fields = ["*"]
+
             collection_metadata = self.metadata[collection_name]
             results = []
 
             for record in collection_metadata:
-                if self._apply_filter(record, filters):
+                if self._apply_filter(record, query_expression):
                     # 选择输出字段
                     if output_fields:
                         filtered_record = {
@@ -363,25 +371,42 @@ class FaissManager(VectorDatabase):
                     if limit and len(results) >= limit:
                         break
 
-            self.logger.debug(
+            logger.debug(
                 f"Query in collection '{collection_name}' returned {len(results)} records"
             )
             return results
 
         except Exception as e:
-            self.logger.error(
+            logger.error(
                 f"Failed to query collection '{collection_name}': {e}", exc_info=True
             )
             return []
 
-    def delete(self, collection_name: str, filters: str, **kwargs) -> bool:
+    def delete(
+        self,
+        collection_name: str,
+        expression: Optional[str] = None,
+        filters: Optional[str] = None,
+        **kwargs,
+    ) -> bool:
         """
         根据条件删除记录
         注意：FAISS 不支持直接删除，这里通过重建索引实现
+
+        Args:
+            collection_name: 集合名称
+            expression: 删除条件表达式 (Milvus风格)
+            filters: 删除条件表达式 (FAISS风格，向后兼容)
         """
         try:
             if collection_name not in self.collections:
                 raise ValueError(f"Collection '{collection_name}' does not exist")
+
+            # 统一处理expression和filters参数
+            delete_expression = expression or filters or ""
+
+            if not delete_expression:
+                raise ValueError("Delete expression cannot be empty")
 
             collection_metadata = self.metadata[collection_name]
 
@@ -390,13 +415,13 @@ class FaissManager(VectorDatabase):
             deleted_count = 0
 
             for record in collection_metadata:
-                if not self._apply_filter(record, filters):
+                if not self._apply_filter(record, delete_expression):
                     remaining_records.append(record)
                 else:
                     deleted_count += 1
 
             if deleted_count == 0:
-                self.logger.info(
+                logger.info(
                     f"No records matched deletion criteria in collection '{collection_name}'"
                 )
                 return True
@@ -430,13 +455,13 @@ class FaissManager(VectorDatabase):
             # 更新记录数
             self.collections[collection_name]["record_count"] = len(remaining_records)
 
-            self.logger.info(
+            logger.info(
                 f"Deleted {deleted_count} records from collection '{collection_name}'"
             )
             return True
 
         except Exception as e:
-            self.logger.error(
+            logger.error(
                 f"Failed to delete from collection '{collection_name}': {e}",
                 exc_info=True,
             )
@@ -452,7 +477,7 @@ class FaissManager(VectorDatabase):
 
         return {
             "name": collection_name,
-            "record_count": collection_info["record_count"],
+            "row_count": collection_info["record_count"],
             "vector_dim": collection_info["vector_dim"],
             "index_type": self.index_type,
             "created_time": collection_info["created_time"],
@@ -483,7 +508,7 @@ class FaissManager(VectorDatabase):
             return 1024
 
         except Exception as e:
-            self.logger.error(f"Failed to extract vector dimension from schema: {e}")
+            logger.error(f"Failed to extract vector dimension from schema: {e}")
             return None
 
     def _create_faiss_index(self, vector_dim: int):
@@ -499,13 +524,13 @@ class FaissManager(VectorDatabase):
             elif self.index_type == "IndexHNSWFlat":
                 return faiss.IndexHNSWFlat(vector_dim, 32)
             else:
-                self.logger.warning(
+                logger.warning(
                     f"Unknown index type '{self.index_type}', using IndexFlatL2"
                 )
                 return faiss.IndexFlatL2(vector_dim)
 
         except Exception as e:
-            self.logger.error(f"Failed to create FAISS index: {e}")
+            logger.error(f"Failed to create FAISS index: {e}")
             return faiss.IndexFlatL2(vector_dim)
 
     def _extract_vector_from_record(
@@ -525,7 +550,7 @@ class FaissManager(VectorDatabase):
             return None
 
         except Exception as e:
-            self.logger.error(f"Failed to extract vector from record: {e}")
+            logger.error(f"Failed to extract vector from record: {e}")
             return None
 
     def _apply_filter(self, record: Dict[str, Any], filters: str) -> bool:
@@ -550,7 +575,7 @@ class FaissManager(VectorDatabase):
             return True
 
         except Exception as e:
-            self.logger.error(f"Failed to apply filter '{filters}': {e}")
+            logger.error(f"Failed to apply filter '{filters}': {e}")
             return True  # 过滤失败时默认包含记录
 
     def _evaluate_condition(self, record: Dict[str, Any], condition: str) -> bool:
@@ -609,7 +634,7 @@ class FaissManager(VectorDatabase):
             return True
 
         except Exception as e:
-            self.logger.error(f"Failed to evaluate condition '{condition}': {e}")
+            logger.error(f"Failed to evaluate condition '{condition}': {e}")
             return True
 
     def _save_all_collections(self):
@@ -618,7 +643,7 @@ class FaissManager(VectorDatabase):
             for collection_name in self.collections:
                 self._save_collection(collection_name)
         except Exception as e:
-            self.logger.error(f"Failed to save collections: {e}", exc_info=True)
+            logger.error(f"Failed to save collections: {e}", exc_info=True)
 
     def _save_collection(self, collection_name: str):
         """保存单个集合到磁盘"""
@@ -642,10 +667,10 @@ class FaissManager(VectorDatabase):
                     self.collections[collection_name], f, ensure_ascii=False, indent=2
                 )
 
-            self.logger.debug(f"Saved collection '{collection_name}' to disk")
+            logger.debug(f"Saved collection '{collection_name}' to disk")
 
         except Exception as e:
-            self.logger.error(
+            logger.error(
                 f"Failed to save collection '{collection_name}': {e}", exc_info=True
             )
 
@@ -661,7 +686,7 @@ class FaissManager(VectorDatabase):
                     self._load_collection(item)
 
         except Exception as e:
-            self.logger.error(
+            logger.error(
                 f"Failed to load existing collections: {e}", exc_info=True
             )
 
@@ -700,12 +725,12 @@ class FaissManager(VectorDatabase):
             self.indexes[collection_name] = index
             self.metadata[collection_name] = metadata
 
-            self.logger.info(
+            logger.info(
                 f"Loaded collection '{collection_name}' with {len(metadata)} records"
             )
 
         except Exception as e:
-            self.logger.error(
+            logger.error(
                 f"Failed to load collection '{collection_name}': {e}", exc_info=True
             )
 
@@ -726,7 +751,7 @@ class FaissManager(VectorDatabase):
                 json.dump(collections_metadata, f, ensure_ascii=False, indent=2)
 
         except Exception as e:
-            self.logger.error(
+            logger.error(
                 f"Failed to save collections metadata: {e}", exc_info=True
             )
 
@@ -737,11 +762,11 @@ class FaissManager(VectorDatabase):
             if os.path.exists(metadata_file):
                 with open(metadata_file, "r", encoding="utf-8") as f:
                     collections_metadata = json.load(f)
-                self.logger.debug(
+                logger.debug(
                     f"Loaded metadata for {len(collections_metadata)} collections"
                 )
 
         except Exception as e:
-            self.logger.error(
+            logger.error(
                 f"Failed to load collections metadata: {e}", exc_info=True
             )

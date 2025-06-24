@@ -14,12 +14,12 @@ from pymilvus.exceptions import (
 # logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 # logger = logging.getLogger(__name__)
 
-from astrbot.core.log import LogManager
+from astrbot.api import logger
 
-logger = LogManager.GetLogger(log_name="Mnemosyne")
+from ..vector_db_base import VectorDatabase, VectorDatabaseType
 
 
-class MilvusManager:
+class MilvusManager(VectorDatabase):
     """
     一个用于管理与 Milvus 数据库交互的类。
     封装了连接、集合管理、数据操作、索引和搜索等常用功能。
@@ -64,6 +64,7 @@ class MilvusManager:
             **kwargs: 传递给 connections.connect 的其他参数。
         """
 
+        super().__init__(VectorDatabaseType.MILVUS)
         self.alias = alias
         self._original_lite_path = lite_path  # 保留原始输入以供参考
         self._lite_path = (
@@ -575,14 +576,35 @@ class MilvusManager:
             self._ensure_connected()
             # 先 flush 获取最新数据
             self.flush([collection_name])  # 确保统计数据相对最新
-            stats = utility.get_collection_stats(
-                collection_name=collection_name, using=self.alias
-            )
-            # stats 返回的是一个包含 'row_count' 等键的字典
-            row_count = int(stats.get("row_count", 0))  # 确保是整数
-            logger.info(f"获取到集合 '{collection_name}' 的统计信息: {stats}")
-            # 返回标准化的字典，包含row_count
-            return {"row_count": row_count, **dict(stats)}
+            # 新版本 pymilvus 中，推荐使用 collection.num_entities
+            row_count = collection.num_entities
+            logger.info(f"获取到集合 '{collection_name}' 的实体数量: {row_count}")
+            # 返回标准化的字典
+            # 提取向量维度和可序列化的 schema 信息
+            vector_dim = 0
+            schema_info = {
+                "description": collection.schema.description,
+                "fields": [],
+            }
+            for f in collection.schema.fields:
+                field_info = {
+                    "name": f.name,
+                    "description": f.description,
+                    "type": str(f.dtype),
+                    "is_primary": f.is_primary,
+                    "params": f.params,
+                }
+                schema_info["fields"].append(field_info)
+                if "VECTOR" in str(f.dtype).upper():
+                    vector_dim = f.params.get("dim", 0)
+
+            return {
+                "row_count": row_count,
+                "description": collection.description,
+                "name": collection.name,
+                "schema": schema_info,
+                "vector_dim": vector_dim,
+            }
         except MilvusException as e:
             logger.error(f"获取集合 '{collection_name}' 统计信息失败: {e}")
             return {"error": str(e)}
@@ -946,17 +968,11 @@ class MilvusManager:
         # 检查加载状态
         try:
             progress = utility.loading_progress(collection_name, using=self.alias)
-            # progress['loading_progress'] 会是 0 到 100 的整数，或 None
-            if progress and progress.get("loading_progress") == 100:
-                logger.info(f"集合 '{collection_name}' 已加载。")
+            if progress.get("loading_progress", 0) == 100:
+                logger.debug(f"集合 '{collection_name}' 已加载。")
                 return True
         except Exception as e:
-            if hasattr(e, 'code') and e.code == 101:  # 集合未加载
-                logger.warning(f"集合 '{collection_name}' 尚未加载，将尝试加载。")
-            else:
-                logger.error(
-                    f"检查集合 '{collection_name}' 加载状态时出错: {e}。将尝试加载。"
-                )
+            logger.warning(f"检查集合 '{collection_name}' 加载状态时出错: {e}。将尝试加载。")
 
         logger.info(f"尝试将集合 '{collection_name}' 加载到内存...")
         try:
@@ -1129,8 +1145,10 @@ class MilvusManager:
             logger.error(f"无法获取集合 '{collection_name}' 以执行查询。")
             return None
 
-        # Query 不需要集合预先加载到内存，但需要连接
-        self._ensure_connected()
+        # 在查询前确保集合已加载
+        if not self.load_collection(collection_name):
+            logger.error(f"查询前加载集合 '{collection_name}' 失败。")
+            return None
 
         # Milvus 对 query 的 limit 有内部限制，如果传入的 limit 过大，可能需要分批查询或调整
         # 默认可能是 16384，检查 pymilvus 文档或 Milvus 配置

@@ -83,13 +83,10 @@ class MnemosyneMigrationTool:
         if "faiss_config" not in new_config:
             new_config["faiss_config"] = {}
 
-        faiss_config = new_config["faiss_config"]
-        if "faiss_data_path" not in faiss_config:
-            faiss_config["faiss_data_path"] = "faiss_data"
-        if "faiss_index_type" not in faiss_config:
-            faiss_config["faiss_index_type"] = "IndexFlatL2"
-        if "faiss_nlist" not in faiss_config:
-            faiss_config["faiss_nlist"] = 100
+        faiss_config = new_config.setdefault("faiss_config", {})
+        faiss_config.setdefault("faiss_data_path", "faiss_data")
+        faiss_config.setdefault("faiss_index_type", "IndexFlatL2")
+        faiss_config.setdefault("faiss_nlist", 100)
 
         # 添加嵌入服务提供商ID配置
         if "embedding_provider_id" not in new_config:
@@ -121,7 +118,7 @@ class MnemosyneMigrationTool:
         """迁移数据库数据"""
         print("\n开始数据库迁移...")
 
-        old_db_type = "milvus"  # 旧版本只支持 Milvus
+        old_db_type = old_config.get("vector_database_type", "milvus")
         new_db_type = new_config.get("vector_database_type", "milvus")
 
         if old_db_type == new_db_type:

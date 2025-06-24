@@ -1,9 +1,7 @@
 import sqlite3
 import os
 
-from astrbot.core.log import LogManager
-
-logging = LogManager.GetLogger(log_name="Message Counter")
+from astrbot.api import logger
 
 
 class MessageCounter:
@@ -63,9 +61,9 @@ class MessageCounter:
                 )
             """)
             conn.commit()
-            logging.debug(f"SQLite 数据库初始化完成，文件路径: {self.db_file}")
+            logger.debug(f"SQLite 数据库初始化完成，文件路径: {self.db_file}")
         except sqlite3.Error as e:
-            logging.error(f"初始化 SQLite 数据库失败: {e}")
+            logger.error(f"初始化 SQLite 数据库失败: {e}")
             if conn:
                 conn.rollback()  # 回滚事务
         finally:
@@ -85,9 +83,9 @@ class MessageCounter:
                 (session_id, 0),
             )
             conn.commit()
-            logging.debug(f"会话 {session_id} 的计数器已重置为 0。")
+            logger.debug(f"会话 {session_id} 的计数器已重置为 0。")
         except sqlite3.Error as e:
-            logging.error(f"重置会话 {session_id} 计数器时发生数据库错误: {e}")
+            logger.error(f"重置会话 {session_id} 计数器时发生数据库错误: {e}")
             if conn:
                 conn.rollback()
         finally:
@@ -114,9 +112,9 @@ class MessageCounter:
                 (session_id,),
             )
             conn.commit()
-            logging.debug(f"会话 {session_id} 的计数器已加 1。")
+            logger.debug(f"会话 {session_id} 的计数器已加 1。")
         except sqlite3.Error as e:
-            logging.error(f"增加会话 {session_id} 计数器时发生数据库错误: {e}")
+            logger.error(f"增加会话 {session_id} 计数器时发生数据库错误: {e}")
             if conn:
                 conn.rollback()
         finally:
@@ -146,7 +144,7 @@ class MessageCounter:
             else:
                 return 0  # 会话 ID 不存在，返回 0
         except sqlite3.Error as e:
-            logging.error(f"获取会话 {session_id} 计数器时发生数据库错误: {e}")
+            logger.error(f"获取会话 {session_id} 计数器时发生数据库错误: {e}")
             return 0  # 发生错误时返回 0，或者可以考虑抛出异常，根据具体需求决定
         finally:
             if conn:
@@ -167,7 +165,7 @@ class MessageCounter:
         history_length = len(context_history)
 
         if history_length < current_counter:
-            logging.warning(
+            logger.warning(
                 f"意外情况: 会话 {session_id} 的上下文历史长度 ({history_length}) 小于消息计数器 ({current_counter})，可能存在数据不一致。"
             )
             conn = None
@@ -179,10 +177,10 @@ class MessageCounter:
                     (history_length, session_id),
                 )
                 conn.commit()
-                logging.warning(f"计数器已调整为上下文历史长度 ({history_length})。")
+                logger.warning(f"计数器已调整为上下文历史长度 ({history_length})。")
                 return False
             except sqlite3.Error as e:
-                logging.error(f"调整会话 {session_id} 计数器时发生数据库错误: {e}")
+                logger.error(f"调整会话 {session_id} 计数器时发生数据库错误: {e}")
                 if conn:
                     conn.rollback()
                 return False  # 调整失败也返回 False，表示可能需要进一步处理
@@ -190,7 +188,7 @@ class MessageCounter:
                 if conn:
                     conn.close()
         else:
-            logging.debug(
+            logger.debug(
                 f"会话 {session_id} 的上下文历史长度 ({history_length}) 与消息计数器 ({current_counter}) 一致。"
             )
             return True

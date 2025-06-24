@@ -31,9 +31,7 @@ from .constants import (
 if TYPE_CHECKING:
     from ..main import Mnemosyne
 
-from astrbot.core.log import LogManager
-
-logger = LogManager.GetLogger(__name__)
+from astrbot.api import logger
 
 
 async def handle_query_memory(

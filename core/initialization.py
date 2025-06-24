@@ -7,7 +7,7 @@ Mnemosyne 插件初始化逻辑
 from typing import TYPE_CHECKING
 from pymilvus import CollectionSchema, FieldSchema, DataType
 
-from astrbot.core.log import LogManager
+from astrbot.api import logger
 
 # 导入必要的类型和模块
 from .constants import (
@@ -26,9 +26,6 @@ from ..memory_manager.context_manager import ConversationContextManager
 # 类型提示，避免循环导入
 if TYPE_CHECKING:
     from ..main import Mnemosyne
-
-# 获取初始化专用的日志记录器
-init_logger = LogManager.GetLogger(log_name="MnemosyneInit")
 
 
 def initialize_config_check(plugin: "Mnemosyne"):
@@ -71,7 +68,7 @@ def initialize_config_check(plugin: "Mnemosyne"):
 
 def initialize_config_and_schema(plugin: "Mnemosyne"):
     """解析配置、验证和定义模式/索引参数。"""
-    init_logger.debug("开始初始化配置和 Schema...")
+    logger.debug("开始初始化配置和 Schema...")
     try:
         embedding_dim = plugin.config.get("embedding_dim", DEFAULT_EMBEDDING_DIM)
         if not isinstance(embedding_dim, int) or embedding_dim <= 0:
@@ -155,14 +152,14 @@ def initialize_config_and_schema(plugin: "Mnemosyne"):
         # if PRIMARY_FIELD_NAME not in plugin.output_fields_for_query:
         #     plugin.output_fields_for_query.append(PRIMARY_FIELD_NAME)
 
-        init_logger.debug(f"集合 Schema 定义完成: '{plugin.collection_name}'")
-        init_logger.debug(f"索引参数: {plugin.index_params}")
-        init_logger.debug(f"搜索参数: {plugin.search_params}")
-        init_logger.debug(f"查询输出字段: {plugin.output_fields_for_query}")
-        init_logger.debug("配置和 Schema 初始化成功。")
+        logger.debug(f"集合 Schema 定义完成: '{plugin.collection_name}'")
+        logger.debug(f"索引参数: {plugin.index_params}")
+        logger.debug(f"搜索参数: {plugin.search_params}")
+        logger.debug(f"查询输出字段: {plugin.output_fields_for_query}")
+        logger.debug("配置和 Schema 初始化成功。")
 
     except Exception as e:
-        init_logger.error(f"初始化配置和 Schema 失败: {e}", exc_info=True)
+        logger.error(f"初始化配置和 Schema 失败: {e}", exc_info=True)
         raise  # 重新抛出异常，以便在主 __init__ 中捕获
 
 
@@ -172,7 +169,7 @@ def initialize_milvus(plugin: "Mnemosyne"):
     根据配置决定连接到 Milvus Lite 或标准 Milvus 服务器，
     并进行必要的集合与索引设置。
     """
-    init_logger.debug("开始初始化 Milvus 连接和设置...")
+    logger.debug("开始初始化 Milvus 连接和设置...")
     connect_args = {}  # 用于收集传递给 MilvusManager 的参数
     is_lite_mode = False  # 标记是否为 Lite 模式
 
@@ -185,26 +182,26 @@ def initialize_milvus(plugin: "Mnemosyne"):
 
         if lite_path:
             # --- 检测到 Milvus Lite 配置 ---
-            init_logger.info(f"检测到 Milvus Lite 配置，将使用本地路径: '{lite_path}'")
+            logger.info(f"检测到 Milvus Lite 配置，将使用本地路径: '{lite_path}'")
             connect_args["lite_path"] = lite_path
             is_lite_mode = True
             if milvus_address:
-                init_logger.warning(
+                logger.warning(
                     f"同时配置了 'milvus_lite_path' 和 'address'，将优先使用 Lite 路径，忽略 'address' ('{milvus_address}')。"
                 )
 
         elif milvus_address:
             # --- 未配置 Lite 路径，使用标准 Milvus 地址 ---
-            init_logger.info(
+            logger.info(
                 f"未配置 Milvus Lite 路径，将根据 'address' 配置连接标准 Milvus: '{milvus_address}'"
             )
             is_lite_mode = False
             # 判断 address 是 URI 还是 host:port
             if milvus_address.startswith(("http://", "https://", "unix:")):
-                init_logger.debug(f"地址 '{milvus_address}' 被识别为 URI。")
+                logger.debug(f"地址 '{milvus_address}' 被识别为 URI。")
                 connect_args["uri"] = milvus_address
             else:
-                init_logger.debug(f"地址 '{milvus_address}' 将被解析为 host:port。")
+                logger.debug(f"地址 '{milvus_address}' 将被解析为 host:port。")
                 try:
                     host, port = parse_address(milvus_address)  # 使用工具函数解析
                     connect_args["host"] = host
@@ -215,7 +212,7 @@ def initialize_milvus(plugin: "Mnemosyne"):
                     ) from e
         else:
             # --- 既没有 Lite 路径也没有标准地址 ---
-            init_logger.warning(
+            logger.warning(
                 "未配置 Milvus Lite 路径和标准 Milvus 地址。请检查配置。将使用默认配置/AstrBot/data/mnemosyne_data"
             )
 
@@ -225,9 +222,9 @@ def initialize_milvus(plugin: "Mnemosyne"):
         # 只有当 db_name 不是 'default' 时才显式添加到参数中，以保持简洁
         if db_name != "default":
             connect_args["db_name"] = db_name
-            init_logger.info(f"将尝试连接到数据库: '{db_name}'。")
+            logger.info(f"将尝试连接到数据库: '{db_name}'。")
         else:
-            init_logger.debug("将使用默认数据库 'default'。")
+            logger.debug("将使用默认数据库 'default'。")
 
         #    设置连接别名
         #    如果未配置，生成一个基于集合名的默认别名
@@ -235,11 +232,11 @@ def initialize_milvus(plugin: "Mnemosyne"):
             "connection_alias", f"mnemosyne_{plugin.collection_name}"
         )
         connect_args["alias"] = alias
-        init_logger.debug(f"设置 Milvus 连接别名为: '{alias}'。")
+        logger.debug(f"设置 Milvus 连接别名为: '{alias}'。")
 
         # 4. 添加仅适用于标准 Milvus 的参数 (如果不是 Lite 模式)
         if not is_lite_mode:
-            init_logger.debug("为标准 Milvus 连接添加认证和安全设置（如果已配置）。")
+            logger.debug("为标准 Milvus 连接添加认证和安全设置（如果已配置）。")
             # 安全地获取认证配置字典，如果不存在则为空字典
             auth_config = plugin.config.get("authentication", {})
 
@@ -267,11 +264,11 @@ def initialize_milvus(plugin: "Mnemosyne"):
                             added_auth_params.append(f"{key}=******")  # 隐藏敏感值
 
             if added_auth_params:
-                init_logger.info(
+                logger.info(
                     f"从配置中添加了标准连接参数: {', '.join(added_auth_params)}"
                 )
             else:
-                init_logger.debug("未找到额外的认证或安全配置。")
+                logger.debug("未找到额外的认证或安全配置。")
 
         else:  # is_lite_mode is True
             # 检查并警告：如果在 Lite 模式下配置了不适用的参数
@@ -282,7 +279,7 @@ def initialize_milvus(plugin: "Mnemosyne"):
                 if k in auth_config and auth_config[k] is not None
             ]
             if ignored_keys:
-                init_logger.warning(
+                logger.warning(
                     f"当前为 Milvus Lite 模式，配置中的以下认证/安全参数将被忽略: {ignored_keys}"
                 )
 
@@ -290,9 +287,7 @@ def initialize_milvus(plugin: "Mnemosyne"):
         loggable_connect_args = {
             k: v for k, v in connect_args.items() if k not in ["password", "token"]
         }
-        init_logger.info(
-            f"准备使用以下参数初始化 MilvusManager: {loggable_connect_args}"
-        )
+        logger.info(f"准备使用以下参数初始化 MilvusManager: {loggable_connect_args}")
 
         # 创建 MilvusManager 实例
         plugin.milvus_manager = MilvusManager(**connect_args)
@@ -305,17 +300,17 @@ def initialize_milvus(plugin: "Mnemosyne"):
             )
 
         mode_name = "Milvus Lite" if plugin.milvus_manager._is_lite else "标准 Milvus"
-        init_logger.info(f"成功连接到 {mode_name} (别名: {alias})。")
+        logger.info(f"成功连接到 {mode_name} (别名: {alias})。")
 
         # 7. 设置集合和索引
-        init_logger.debug("开始设置 Milvus 集合和索引...")
+        logger.debug("开始设置 Milvus 集合和索引...")
         setup_milvus_collection_and_index(plugin)
-        init_logger.info("Milvus 集合和索引设置流程已调用。")
+        logger.info("Milvus 集合和索引设置流程已调用。")
 
-        init_logger.debug("Milvus 初始化流程成功完成。")
+        logger.debug("Milvus 初始化流程成功完成。")
 
     except Exception as e:
-        init_logger.error(
+        logger.error(
             f"Milvus 初始化或设置过程中发生错误: {e}", exc_info=True
         )  # exc_info=True 会记录堆栈跟踪
         plugin.milvus_manager = None  # 确保在初始化失败时 manager 被设为 None
@@ -325,24 +320,24 @@ def initialize_milvus(plugin: "Mnemosyne"):
 def setup_milvus_collection_and_index(plugin: "Mnemosyne"):
     """确保 Milvus 集合和索引存在并已加载。"""
     if not plugin.milvus_manager or not plugin.collection_schema:
-        init_logger.error("无法设置 Milvus 集合/索引：管理器或 Schema 未初始化。")
+        logger.error("无法设置 Milvus 集合/索引：管理器或 Schema 未初始化。")
         raise RuntimeError("MilvusManager 或 CollectionSchema 未准备好。")
 
     collection_name = plugin.collection_name
 
     # 检查集合是否存在
     if plugin.milvus_manager.has_collection(collection_name):
-        init_logger.info(f"集合 '{collection_name}' 已存在。开始检查 Schema 一致性...")
+        logger.info(f"集合 '{collection_name}' 已存在。开始检查 Schema 一致性...")
         check_schema_consistency(plugin, collection_name, plugin.collection_schema)
         # 注意: check_schema_consistency 目前只记录警告，不阻止后续操作
     else:
         # 如果集合不存在，则创建集合
-        init_logger.info(f"未找到集合 '{collection_name}'。正在创建...")
+        logger.info(f"未找到集合 '{collection_name}'。正在创建...")
         if not plugin.milvus_manager.create_collection(
             collection_name, plugin.collection_schema
         ):
             raise RuntimeError(f"创建 Milvus 集合 '{collection_name}' 失败。")
-        init_logger.info(f"成功创建集合 '{collection_name}'。")
+        logger.info(f"成功创建集合 '{collection_name}'。")
         # 创建集合后立即尝试创建索引
         ensure_milvus_index(plugin, collection_name)
 
@@ -350,16 +345,16 @@ def setup_milvus_collection_and_index(plugin: "Mnemosyne"):
     ensure_milvus_index(plugin, collection_name)
 
     # 确保集合已加载到内存中以供搜索
-    init_logger.info(f"确保集合 '{collection_name}' 已加载到内存...")
+    logger.info(f"确保集合 '{collection_name}' 已加载到内存...")
     if not plugin.milvus_manager.load_collection(collection_name):
         # 加载失败可能是资源问题或索引未就绪，打印错误但可能允许插件继续（取决于容错策略）
-        init_logger.error(
+        logger.error(
             f"加载集合 '{collection_name}' 失败。搜索功能可能无法正常工作或效率低下。"
         )
         # 可以考虑在这里抛出异常，如果加载是强制要求的话
         # raise RuntimeError(f"加载 Milvus 集合 '{collection_name}' 失败。")
     else:
-        init_logger.info(f"集合 '{collection_name}' 已成功加载。")
+        logger.info(f"集合 '{collection_name}' 已成功加载。")
 
 
 def ensure_milvus_index(plugin: "Mnemosyne", collection_name: str):
@@ -371,7 +366,7 @@ def ensure_milvus_index(plugin: "Mnemosyne", collection_name: str):
         has_vector_index = False
         # 先检查集合是否存在，避免后续操作出错
         if not plugin.milvus_manager.has_collection(collection_name):
-            init_logger.warning(
+            logger.warning(
                 f"尝试为不存在的集合 '{collection_name}' 检查/创建索引，跳过。"
             )
             return
@@ -387,21 +382,21 @@ def ensure_milvus_index(plugin: "Mnemosyne", collection_name: str):
                     # configured_index_type = plugin.index_params.get('index_type')
                     # actual_index_type = index_info.get('index_type', index_info.get('index_param', {}).get('index_type')) # 兼容不同版本/API
                     # if configured_index_type and actual_index_type and configured_index_type != actual_index_type:
-                    #     init_logger.warning(f"集合 '{collection_name}' 字段 '{VECTOR_FIELD_NAME}' 的索引类型 ({actual_index_type}) 与配置 ({configured_index_type}) 不符。")
+                    #     logger.warning(f"集合 '{collection_name}' 字段 '{VECTOR_FIELD_NAME}' 的索引类型 ({actual_index_type}) 与配置 ({configured_index_type}) 不符。")
                     # else:
-                    init_logger.info(
+                    logger.info(
                         f"在集合 '{collection_name}' 上检测到字段 '{VECTOR_FIELD_NAME}' 的现有索引。"
                     )
                     has_vector_index = True
                     break  # 找到即可退出循环
         else:
-            init_logger.warning(
+            logger.warning(
                 f"无法获取集合 '{collection_name}' 的对象来详细验证索引信息。"
             )
 
         # 如果没有找到向量索引，则尝试创建
         if not has_vector_index:
-            init_logger.warning(
+            logger.warning(
                 f"集合 '{collection_name}' 的向量字段 '{VECTOR_FIELD_NAME}' 尚未创建索引。正在尝试创建..."
             )
             # 使用配置好的索引参数创建索引
@@ -415,43 +410,43 @@ def ensure_milvus_index(plugin: "Mnemosyne", collection_name: str):
                 ),  # 增加创建索引的超时设置
             )
             if not index_success:
-                init_logger.error(
+                logger.error(
                     f"为字段 '{VECTOR_FIELD_NAME}' 创建索引失败。搜索性能将受到严重影响。请检查 Milvus 日志。"
                 )
                 # 根据需要，可以考虑抛出异常
             else:
-                init_logger.info(
+                logger.info(
                     f"已为字段 '{VECTOR_FIELD_NAME}' 发送索引创建请求。索引将在后台构建。"
                 )
                 # 创建索引后，可能需要等待其构建完成才能获得最佳性能，但通常可以继续运行
                 # 可以考虑添加一个检查索引状态的步骤，或者在首次搜索前强制 load
 
     except Exception as e:
-        init_logger.error(f"检查或创建集合 '{collection_name}' 的索引时发生错误: {e}")
+        logger.error(f"检查或创建集合 '{collection_name}' 的索引时发生错误: {e}")
         # 决定是否重新抛出异常，这可能会阻止插件启动
         raise
 
 
 def initialize_components(plugin: "Mnemosyne"):
     """初始化非 Milvus 的其他组件，如上下文管理器和嵌入 API。"""
-    init_logger.debug("开始初始化其他核心组件...")
+    logger.debug("开始初始化其他核心组件...")
     # 1. 初始化消息计数器和上下文管理器
     try:
         plugin.context_manager = ConversationContextManager()
         plugin.msg_counter = MessageCounter()
-        init_logger.info("消息计数器初始化成功。")
+        logger.info("消息计数器初始化成功。")
     except Exception as e:
-        init_logger.error(f"消息计数器初始化失败:{e}")
+        logger.error(f"消息计数器初始化失败:{e}")
         raise
 
     # 2. 检查嵌入服务适配器状态
     # 注意：嵌入服务现在在 on_astrbot_loaded 钩子中初始化
     if plugin.embedding_adapter:
-        init_logger.info("嵌入服务适配器已在 on_astrbot_loaded 钩子中成功初始化")
+        logger.info("嵌入服务适配器已在 on_astrbot_loaded 钩子中成功初始化")
     else:
-        init_logger.warning("嵌入服务适配器尚未初始化，某些功能可能不可用")
+        logger.warning("嵌入服务适配器尚未初始化，某些功能可能不可用")
 
-    init_logger.debug("其他核心组件初始化完成。")
+    logger.debug("其他核心组件初始化完成。")
 
 
 def check_schema_consistency(
@@ -464,13 +459,13 @@ def check_schema_consistency(
     if not plugin.milvus_manager or not plugin.milvus_manager.has_collection(
         collection_name
     ):
-        # init_logger.info(f"集合 '{collection_name}' 不存在，无需检查一致性。")
+        # logger.info(f"集合 '{collection_name}' 不存在，无需检查一致性。")
         return True  # 没有可供比较的现有集合
 
     try:
         collection = plugin.milvus_manager.get_collection(collection_name)
         if not collection:
-            init_logger.error(f"无法获取集合 '{collection_name}' 以检查 Schema。")
+            logger.error(f"无法获取集合 '{collection_name}' 以检查 Schema。")
             return False  # 视为不一致
 
         actual_schema = collection.schema
@@ -570,14 +565,14 @@ def check_schema_consistency(
                 + "\n - ".join(warnings)
             )
             warning_message += "\n请检查您的 Milvus 集合结构或插件配置。不一致可能导致运行时错误或数据问题。"
-            init_logger.warning(warning_message)
+            logger.warning(warning_message)
         else:
-            init_logger.info(f"集合 '{collection_name}' 的 Schema 与当前配置基本一致。")
+            logger.info(f"集合 '{collection_name}' 的 Schema 与当前配置基本一致。")
 
         return consistent
 
     except Exception as e:
-        init_logger.error(
+        logger.error(
             f"检查集合 '{collection_name}' Schema 一致性时发生错误: {e}", exc_info=True
         )
         return False  # 将错误视为不一致
